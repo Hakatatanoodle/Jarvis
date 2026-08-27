@@ -1,0 +1,21 @@
+# Local dev only — Postgres+pgvector. No k8s, no cloud infra (per decision).
+# Requires local verification: not run inside this sandbox (no Docker Hub
+# access in the network allowlist). See ARCHITECTURE_ISSUES.md.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jarvis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jarvis_dev_local}
+      POSTGRES_DB: ${POSTGRES_DB:-jarvis}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - jarvis_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jarvis}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  jarvis_pg_data:

@@ -1,0 +1,78 @@
+# Jarvis V0 default configuration.
+# Human-readable, versioned, no binary/code-embedded config (§8, INF-27/28/29).
+config_version: 1
+
+logging:
+  level: INFO
+
+storage:
+  # local-first (INF-02): Postgres is the structured store, pgvector is
+  # enabled from the start per §6's stack assumption even though semantic
+  # search itself is deferred (§5.3).
+  postgres:
+    host: localhost
+    port: 5432
+    database: jarvis
+    user: jarvis
+  pgvector_enabled: true
+
+llm:
+  # Multi-model routing (infra/llm_router.py). Routing decision stays
+  # fixed/rule-based per task category (§5.1 — not the adaptive, learned
+  # routing §5.3 defers to INF-V1); this section only holds the ordered
+  # candidate chains and provider connection info so changing a model is
+  # a config edit, not a code change. Verified against provider docs
+  # 2026-08-14 — see ARCHITECTURE_ISSUES.md's 2026-08-14 entry for the
+  # research summary and rationale (llama-3.1-8b-instant / llama-3.3-70b-versatile
+  # are mid-shutdown on Groq as of this date; replaced per Groq's own
+  # migration guidance).
+  default_max_tokens: 4096
+
+  providers:
+    groq:
+      api_key_env: GROQ_API_KEY
+      base_url: https://api.groq.com/openai/v1/chat/completions
+    gemini:
+      api_key_env: GEMINI_API_KEY
+      base_url: https://generativelanguage.googleapis.com/v1beta/interactions
+    openrouter:
+      api_key_env: OPENROUTER_API_KEY
+      base_url: https://openrouter.ai/api/v1/chat/completions
+
+  # Ordered fallback chains per task category. Each candidate declares
+  # the capabilities it satisfies so the router never picks a fallback
+  # that can't meet a request's requirements (e.g. vision).
+  routes:
+    chat:
+      - {provider: gemini, model: gemini-3.5-flash-lite, capabilities: [text, json]}
+      - {provider: groq, model: openai/gpt-oss-20b, capabilities: [text, json, tool_calling]}
+    hard:
+      - {provider: gemini, model: gemini-3.6-flash, capabilities: [text, json, tool_calling, long_context, vision]}
+      - {provider: groq, model: openai/gpt-oss-120b, capabilities: [text, json, tool_calling, reasoning]}
+      - {provider: groq, model: qwen/qwen3.6-27b, capabilities: [text, json, vision, reasoning]}
+    coding:
+      - {provider: openrouter, model: "qwen/qwen3-coder:free", capabilities: [text, json, tool_calling, long_context]}
+      - {provider: gemini, model: gemini-3.6-flash, capabilities: [text, json, tool_calling, long_context, vision]}
+      - {provider: groq, model: openai/gpt-oss-120b, capabilities: [text, json, tool_calling, reasoning]}
+
+  # Final emergency pool once every route candidate above has failed.
+  # openrouter/free is OpenRouter's own auto-router alias (not a pinned
+  # model), so it keeps working as individual free-tier models rotate.
+  emergency_fallback:
+    provider: openrouter
+    model: openrouter/free
+    capabilities: [text, json]
+
+context:
+  # Context Budget is computed dynamically per-request by the Orchestrator
+  # (CE-10); this is only the ceiling it operates under.
+  default_budget_tokens: 8000
+
+permission:
+  # V0 ships binary allow/deny/confirm only. Permission Profiles
+  # (Conservative/Balanced/Autonomous, PS-06) are §5.2 scope, not M0.
+  default_mode: confirmation_required
+
+insight:
+  # Weekly only in V0 (§5.1). See contracts.enums.InsightScope.
+  enabled_scopes: [weekly]
