@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 data/files/*
 !data/files/.gitkeep
+data/google_calendar/gcp-oauth.keys.json
+data/google_calendar/tokens.json
