@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+data/files/*
+!data/files/.gitkeep
+
+# M5: Google OAuth client config + the calendar-mcp server's own token
+# storage. Never versioned (config/default.yaml only holds the *path* to
+# this directory, per §8's no-code-embedded-credential discipline) — see
+# capabilities/primitives/calendar_ops.py and infra/mcp_client.py.
+data/google_calendar/*
+!data/google_calendar/.gitkeep
