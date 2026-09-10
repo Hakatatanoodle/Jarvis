@@ -4,6 +4,7 @@ instance — matches acceptance criteria in V1_M1_IMPLEMENTATION_PLAN.md §8.
 import pytest
 from unittest.mock import AsyncMock, patch
 
+import capabilities.bootstrap  # noqa: F401 — registers goals.advance for V1-M4 tests below
 from conversation.api import (
     _claims_unbacked_action,
     _matches_fast_path_greeting,
@@ -15,7 +16,9 @@ from conversation.api import (
     handle,
     resolve_pending_memory,
     resolve_pending_state_change,
+    resolve_pending_capability_invocation,
 )
+from contracts.capability_invocation_candidate import CapabilityInvocationCandidate
 from contracts.enums import GoalStatus, GoalType, MemoryStatus, MemoryType
 from contracts.memory_candidate import MemoryCandidate, MemoryScope
 from contracts.state_change_candidate import StateChangeCandidate, StateChangeOperation
@@ -39,6 +42,17 @@ pytestmark = pytest.mark.usefixtures("clean_db")
     ("Not much, just checking the weather.", False),
     ("I don't have access to your name at the moment.", False),
     ("Sure, I can help with that once it's built.", False),
+    # 2026-08-28 dogfooding: "what can you tell about me?" answered by
+    # correctly recalling durable memory, and got rejected anyway —
+    # see _claims_unbacked_action's revision note for the mechanism.
+    ("Based on what I have stored, you're focused on building a life you are "
+     "proud of and growing your YouTube channel.", False),  # the actual reported bug
+    ("From what I've recorded, you prefer tea over coffee.", False),  # same construction, different verb
+    ("I know you are working toward financial freedom.", False),  # its sibling that always passed
+    # Must still catch a genuine claim even when phrased slightly
+    # differently from the original 2026-08-14 report.
+    ("I have scheduled a reminder for tomorrow.", True),
+    ("I'll remember that and I've noted it down.", True),
 ])
 def test_claims_unbacked_action_detector(text, expected):
     assert _claims_unbacked_action(text) == expected
@@ -55,7 +69,7 @@ async def test_conversational_reply_claiming_memory_gets_replaced_with_honesty()
     # claim isn't backed by one, so it must still never reach the user
     # as-is.
     await set_mission(title="Grow", statement="Statement.")
-    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="I've noted the word 'coco' for the moment.")):
         outcome = await handle("remember this word = 'coco'")
     assert outcome.routed_to == "conversation"
@@ -82,7 +96,7 @@ async def test_present_tense_recall_of_existing_memory_is_not_blocked():
     await create_memory(type=MemoryType.FACT, title="user's name", value="Yochan", source_ids=["src-1"])
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[])), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(
              return_value="You're Yochan, and I know you like working mornings.")):
         outcome = await handle("what do you know about me?")
@@ -94,7 +108,7 @@ async def test_persistence_phrasing_about_old_memory_is_still_blocked():
     await create_memory(type=MemoryType.FACT, title="user's name", value="Yochan", source_ids=["src-1"])
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[])), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="I've noted that you're Yochan.")):
         outcome = await handle("what do you know about me?")
     assert "won't claim that" in outcome.response_text.lower()
@@ -168,7 +182,7 @@ async def test_routing_llm_failure_defaults_to_reasoning_not_conversation():
 
 async def test_ambiguous_input_routed_conversational_by_llm_does_not_reach_reasoning():
     await set_mission(title="Grow", statement="Statement.")
-    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Ha, not much! What's up?")):
         outcome = await handle("why do you always talk about goals?")
     assert outcome.routed_to == "conversation"
@@ -178,7 +192,7 @@ async def test_ambiguous_input_routed_conversational_by_llm_does_not_reach_reaso
 async def test_every_turn_archived_exactly_once_both_paths():
     await set_mission(title="Grow", statement="Statement.")
     await create_goal(type=GoalType.PROJECT, title="Build jarvis v1")
-    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": True, "memory_candidate_possible": True, "state_change_possible": False})):
+    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": True, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})):
         await handle("what should i work on today?")
     with patch("conversation.api.complete_json", new=AsyncMock(return_value=None)), \
          patch("conversation.api.complete", new=AsyncMock(return_value="hey!")):
@@ -210,7 +224,7 @@ async def test_recent_turns_get_fed_into_the_conversational_prompt():
         captured_prompt["value"] = prompt
         return "Sure thing, Yochan."
 
-    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         await handle("call me Yochan from now on")
         await handle("what did I just ask you to call me?")
@@ -259,7 +273,7 @@ def test_mentions_fabricated_ui_detector(text, expected):
 
 async def test_conversational_reply_inventing_a_ui_gets_replaced_with_honesty():
     await set_mission(title="Grow", statement="Statement.")
-    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(
              return_value="It's all listed for you under the Mission tab."
          )):
@@ -285,7 +299,7 @@ def test_leaks_prompt_structure_detector(text, expected):
 
 async def test_conversational_reply_leaking_prompt_labels_gets_replaced():
     await set_mission(title="I wanna be ironman", statement="Statement.")
-    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(
              return_value="Mission: I wanna be ironman\n\nLet's talk about becoming Iron Man."
          )):
@@ -307,7 +321,7 @@ async def test_explicit_statement_creates_durable_memory():
         scope=MemoryScope.DURABLE, explicit=True, raw_user_text="My name is Yochan.",
     )
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[candidate])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Nice to meet you, Yochan!")):
         outcome = await handle("My name is Yochan.")
 
@@ -333,7 +347,7 @@ async def test_multiple_candidates_from_one_message_all_written():
         ),
     ]
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=candidates)), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="That's a real blueprint.")):
         outcome = await handle("dream text")
 
@@ -356,7 +370,7 @@ async def test_memory_action_grounding_reaches_the_prompt():
         return "Nice to meet you, Yochan!"
 
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[candidate])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         await handle("My name is Yochan.")
 
@@ -373,7 +387,7 @@ async def test_second_mention_updates_rather_than_duplicates():
         type=MemoryType.PREFERENCE, title="user's preferred editor", value="Neovim",
         scope=MemoryScope.DURABLE, explicit=True, raw_user_text="Actually I switched to Neovim",
     )
-    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+    with patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Got it.")):
         with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[first])):
             await handle("I prefer VS Code")
@@ -393,7 +407,7 @@ async def test_ambiguous_candidate_asks_for_confirmation_not_immediate_write():
         scope=MemoryScope.AMBIGUOUS, explicit=True, raw_user_text="I'm tired today",
     )
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[candidate])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Hope your day gets better.")):
         outcome = await handle("I'm tired today")
 
@@ -416,7 +430,7 @@ async def test_multiple_ambiguous_candidates_all_queued_for_confirmation():
         ),
     ]
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=candidates)), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Got it.")):
         outcome = await handle("text")
 
@@ -432,7 +446,7 @@ async def test_confirming_pending_memory_writes_it():
         scope=MemoryScope.AMBIGUOUS, explicit=True, raw_user_text="I'm tired today",
     )
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[candidate])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Hope your day gets better.")):
         outcome = await handle("I'm tired today")
 
@@ -449,7 +463,7 @@ async def test_declining_pending_memory_does_not_write():
         scope=MemoryScope.AMBIGUOUS, explicit=True, raw_user_text="I'm tired today",
     )
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[candidate])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Hope your day gets better.")):
         outcome = await handle("I'm tired today")
 
@@ -466,7 +480,7 @@ async def test_sensitive_candidate_never_written_and_never_asks_confirmation():
         scope=MemoryScope.DURABLE, explicit=True, raw_user_text="my api key is sk-abc123",
     )
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[candidate])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Understood.")):
         outcome = await handle("my api key is sk-abc123")
 
@@ -482,7 +496,7 @@ async def test_taxonomy_gap_candidate_not_written_but_recorded_as_gap():
         scope=MemoryScope.DURABLE, explicit=True, raw_user_text="My blood type is O negative",
     )
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[candidate])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Good to know.")):
         outcome = await handle("My blood type is O negative")
 
@@ -505,7 +519,7 @@ async def test_session_scoped_candidate_not_written():
         scope=MemoryScope.SESSION, explicit=True, raw_user_text="I'm debugging something right now",
     )
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[candidate])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Good luck with that.")):
         outcome = await handle("I'm debugging something right now")
 
@@ -526,7 +540,7 @@ async def test_known_memories_are_fed_into_the_conversational_prompt():
         return "Hey Yochan!"
 
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[])), \
-         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+         patch("conversation.api.complete_json", new=AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         await handle("hey")
 
@@ -600,7 +614,7 @@ async def test_memory_candidate_impossible_skips_extraction_call_entirely():
     extract_mock = AsyncMock(return_value=[])
     with patch("conversation.api.extract_candidates", new=extract_mock), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Sure thing.")):
         outcome = await handle("what should I work on today?")
 
@@ -614,19 +628,20 @@ async def test_memory_candidate_possible_does_call_extraction():
     extract_mock = AsyncMock(return_value=[])
     with patch("conversation.api.extract_candidates", new=extract_mock), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Sure thing.")):
         await handle("call me Yochan")
 
     extract_mock.assert_called_once_with("call me Yochan", known_memories=[])
 
 
-async def test_routing_failure_fails_open_to_both_true():
-    # §3 in conversation/api.py: memory_candidate_possible fails OPEN
-    # (True) on a malformed/unavailable routing call, unlike a false
-    # positive there's no downstream recovery for a silently dropped
-    # memory. needs_reasoning also stays fail-closed to True (pre-M3
-    # behavior, unchanged).
+async def test_routing_failure_fails_open_to_all_true():
+    # §3 in conversation/api.py: memory_candidate_possible,
+    # state_change_possible, and (V1-M4) capability_invocation_possible
+    # all fail OPEN (True) on a malformed/unavailable routing call,
+    # unlike a false positive there's no downstream recovery for a
+    # silently dropped memory/command. needs_reasoning also stays
+    # fail-closed to True (pre-M3 behavior, unchanged).
     await set_mission(title="Grow", statement="Statement.")
     extract_mock = AsyncMock(return_value=[])
     with patch("conversation.api.extract_candidates", new=extract_mock), \
@@ -640,7 +655,7 @@ async def test_routing_failure_fails_open_to_both_true():
 
 async def test_route_uses_exactly_one_llm_call_for_routing_decisions():
     await set_mission(title="Grow", statement="Statement.")
-    routing_mock = AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False})
+    routing_mock = AsyncMock(return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})
     with patch("conversation.api.complete_json", new=routing_mock), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Sure thing.")):
         await handle("hello there, general banter")
@@ -667,7 +682,7 @@ async def test_known_memories_are_passed_to_extraction():
     extract_mock = AsyncMock(return_value=[])
     with patch("conversation.api.extract_candidates", new=extract_mock), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Got it.")):
         await handle("I don't like girls")
 
@@ -687,7 +702,7 @@ async def test_known_memories_not_fetched_when_memory_candidate_impossible():
     extract_mock = AsyncMock(return_value=[])
     with patch("conversation.api.extract_candidates", new=extract_mock), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Sure.")):
         await handle("what should I have for lunch?")
 
@@ -711,7 +726,7 @@ async def test_reused_title_and_type_from_extraction_correctly_updates_not_dupli
     )
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[correction])), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Got it.")):
         await handle("I don't like girls")
 
@@ -749,6 +764,29 @@ def test_routing_prompt_distinguishes_named_goal_questions_from_generic_capabili
     lowered = _ROUTING_SYSTEM.lower()
     assert "what statuses can i move my test goal to" in lowered
     assert "generic" in lowered and "with no specific goal" in lowered
+
+
+# --- regression: 2026-08-29 dogfooding, defense-in-depth --------------
+# "what can i do with archive goals?" stayed in the plain conversational
+# path (no real transition data available there at all) and answered
+# "I do not have the ability to modify or move goals right now" — false;
+# this system had archived a goal via natural language two turns
+# earlier in the same conversation. The conclusion happened to be right
+# (Archived is terminal) but the stated reason was a fabricated blanket
+# incapacity, not a reasoned answer. Two changes, verified as prompt
+# content only — same honest limitation as every other routing/prompt
+# fix in this file, this cannot verify a given model actually complies.
+
+def test_routing_prompt_covers_what_can_i_do_with_cancelled_or_archived_goals():
+    lowered = _ROUTING_SYSTEM.lower()
+    assert "what can i do with my cancelled goals" in lowered
+    assert "can i make an archived goal active again" in lowered
+
+
+def test_conversational_prompt_forbids_blanket_incapacity_claim_about_goal_status():
+    lowered = _CONVERSATIONAL_SYSTEM.lower()
+    assert "never say a blanket 'i don't have the ability to modify goals'" in lowered
+    assert "not certain of that specific status's rule" in lowered
 
 
 # --- 2026-08-17c: prefer the user's known name over a generic title ---
@@ -812,7 +850,7 @@ async def test_grounded_reply_uses_the_llm_answer_when_it_passes_the_guards():
     await create_goal(type=GoalType.PROJECT, title="Build jarvis v1")
     good_answer = "You've got one project on record, Build jarvis v1 — let's break today into two steps."
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value=good_answer)):
         outcome = await handle("build me a plan for today")
     assert outcome.response_text == good_answer
@@ -827,7 +865,7 @@ async def test_grounded_reply_falls_back_when_guard_rejects_invented_relationshi
     await create_goal(type=GoalType.LIFE_GOAL, title="Run a marathon")
     hallucinated = "Build jarvis v1 depends on finishing Run a marathon first."
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value=hallucinated)):
         outcome = await handle("how are my goals related?")
     assert "depends on" not in outcome.response_text
@@ -841,7 +879,7 @@ async def test_grounded_reply_never_creates_a_plan_or_action():
     await set_mission(title="Grow", statement="Statement.")
     await create_goal(type=GoalType.PROJECT, title="Build jarvis v1")
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Here's a plan for today.")):
         await handle("what should i work on today?")
     actions = await list_actions()
@@ -852,7 +890,7 @@ async def test_grounded_reply_persists_a_decision_with_no_plan_required():
     await set_mission(title="Grow", statement="Statement.")
     await create_goal(type=GoalType.PROJECT, title="Build jarvis v1")
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Here's a plan for today.")):
         await handle("what should i work on today?")
     decisions = await list_decisions()
@@ -864,7 +902,7 @@ async def test_grounded_reply_persists_a_decision_with_no_plan_required():
 async def test_grounded_reply_intent_is_labeled_conversation_in_decision_history():
     await set_mission(title="Grow", statement="Statement.")
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="No goals yet — want to set one?")):
         await handle("what should i work on today?")
     pairs = await list_decisions_with_intent(limit=10)
@@ -886,7 +924,7 @@ async def test_grounded_reply_gets_recent_conversation_for_followups():
         return "Updated plan: focus on tests first."
 
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})):
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})):
         with patch("conversation.api.complete", new=AsyncMock(return_value="Here's today's plan: step one, step two.")):
             await handle("build me a plan for today")
         with patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
@@ -934,7 +972,7 @@ async def test_grounded_reply_uses_a_generous_token_budget():
     await create_goal(type=GoalType.PROJECT, title="Build jarvis v1")
     complete_mock = AsyncMock(return_value="A full schedule for today.")
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=complete_mock):
         await handle("build me a schedule for today")
 
@@ -963,7 +1001,7 @@ async def test_grounded_reply_not_rejected_for_accurate_multi_goal_plan():
         "still in Draft, so no pressure on those yet."
     )
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value=real_answer)):
         outcome = await handle("what should i work on today?")
 
@@ -1008,7 +1046,7 @@ def test_strip_markdown_does_not_touch_single_asterisks():
 async def test_conversational_reply_strips_markdown_from_llm_output():
     await set_mission(title="Grow", statement="Statement.")
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="**Hey there!** Let's go.")):
         outcome = await handle("hi")
     assert "**" not in outcome.response_text
@@ -1020,7 +1058,7 @@ async def test_grounded_reply_strips_markdown_from_llm_output():
     await create_goal(type=GoalType.PROJECT, title="Build jarvis v1")
     markdown_answer = "1. **Set a start time** – pick something realistic.\n2. **Study topic A** – 45 minutes."
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value=markdown_answer)):
         outcome = await handle("plan my exam study day")
     assert "**" not in outcome.response_text
@@ -1043,7 +1081,7 @@ async def test_create_goal_command_executes_immediately():
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Done — added that goal.")):
         outcome = await handle("create a goal to run a marathon")
 
@@ -1066,7 +1104,7 @@ async def test_unambiguous_status_change_executes_immediately():
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Paused it.")):
         outcome = await handle("pause my build jarvis goal")
 
@@ -1087,7 +1125,7 @@ async def test_cancel_command_asks_confirmation_and_does_not_write_until_approve
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Want me to go ahead?")):
         outcome = await handle("cancel my build jarvis goal")
 
@@ -1113,7 +1151,7 @@ async def test_cancel_command_declined_leaves_goal_unchanged():
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Want me to go ahead?")):
         outcome = await handle("cancel my build jarvis goal")
 
@@ -1121,6 +1159,128 @@ async def test_cancel_command_declined_leaves_goal_unchanged():
     assert status is None
     unchanged = await list_goals()
     assert unchanged[0].status == GoalStatus.ACTIVE
+
+
+# --- V1-M4: natural-language Capability invocation (goals.advance only) ---
+# Same integration shape as the M2 section above:
+# capability_invocation.extraction.extract_candidate is patched directly
+# (its own module-level LLM call); dispatch itself (Decision/Plan/Action
+# synthesis, orchestrator._handle_action, the real goals.api write) runs
+# for real against the DB, exercising handle()'s wiring end to end.
+
+async def test_capability_invocation_executes_and_is_framed_as_completed():
+    await set_mission(title="Grow", statement="Statement.")
+    goal = await create_goal(type=GoalType.PROJECT, title="Build Jarvis")
+
+    candidate = CapabilityInvocationCandidate(
+        capability_id="goals.advance", raw_user_text="touch my build jarvis goal",
+        goal_ref="Build Jarvis", resolved_goal_id=goal.id, match_count=1,
+    )
+    reply_mock = AsyncMock(return_value="Done — advanced that goal.")
+    with patch("conversation.api.extract_capability_invocation", new=AsyncMock(return_value=candidate)), \
+         patch("conversation.api.complete_json", new=AsyncMock(
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": True})), \
+         patch("conversation.api.complete", new=reply_mock):
+        outcome = await handle("touch my build jarvis goal")
+
+    assert outcome.pending_capability_invocations == []
+    updated = await list_goals()
+    assert updated[0].version == goal.version + 1  # the real goals.advance write actually happened
+
+    # The completed-write fact was passed to the reply model as
+    # memory_grounding ("Action just taken this turn"), never as
+    # relay_note — same distinction _apply_state_change_policy's
+    # docstring establishes for the 2026-08-26 dogfooding bug.
+    prompt_used = reply_mock.call_args.kwargs["prompt"]
+    assert "Action just taken this turn" in prompt_used
+    assert "Ran Advance Goal" in prompt_used
+    assert "isn't finished yet" not in prompt_used
+
+
+# --- regression: 2026-09-01 dogfooding — blanket "none of these are
+# available" capability claim contradicted a same-turn completed-action
+# fact, and the reply model believed the blanket claim over the fact
+# ("I don't have the ability to read the file... but from the snippet
+# you shared"). Fixed by making _capability_grounding per-capability
+# and turn-accurate instead of a single unconditional sentence.
+
+async def test_capability_grounding_has_no_blanket_incapacity_claim_when_something_executed():
+    await set_mission(title="Grow", statement="Statement.")
+    goal = await create_goal(type=GoalType.PROJECT, title="Build Jarvis")
+
+    candidate = CapabilityInvocationCandidate(
+        capability_id="goals.advance", raw_user_text="touch my build jarvis goal",
+        goal_ref="Build Jarvis", resolved_goal_id=goal.id, match_count=1,
+    )
+    reply_mock = AsyncMock(return_value="Done — advanced that goal.")
+    with patch("conversation.api.extract_capability_invocation", new=AsyncMock(return_value=candidate)), \
+         patch("conversation.api.complete_json", new=AsyncMock(
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": True})), \
+         patch("conversation.api.complete", new=reply_mock):
+        await handle("touch my build jarvis goal")
+
+    prompt_used = reply_mock.call_args.kwargs["prompt"]
+    # The old unconditional blanket claim must be gone entirely — not
+    # just overridden elsewhere in the prompt, literally absent, since
+    # its mere presence is what caused the model to believe it over the
+    # per-turn fact.
+    assert "no ability to call any capability" not in prompt_used
+    assert "None of these" not in prompt_used
+    # The capability that actually ran gets an honest, specific status...
+    assert "goals.advance" in prompt_used and "JUST EXECUTED this turn" in prompt_used
+    # ...and one that didn't run this turn is honestly described as
+    # available-but-unused, never as categorically impossible.
+    assert "fs.read" in prompt_used and "not invoked this turn" in prompt_used
+
+
+async def test_capability_grounding_marks_pending_confirmation_distinctly_from_executed():
+    await set_mission(title="Grow", statement="Statement.")
+    import capabilities.primitives.fs_ops as fs_ops
+    import tempfile
+    from pathlib import Path
+    from capability_invocation import dispatch as dispatch_module
+    with tempfile.TemporaryDirectory() as d:
+        fs_ops.configure_for_test([Path(d)], [])
+        dispatch_module._current_directory = None  # avoid leakage from other tests' tmp roots
+        candidate = CapabilityInvocationCandidate(
+            capability_id="fs.write", raw_user_text="write hello to notes.txt",
+            path_ref="notes.txt", content="hello",
+        )
+        reply_mock = AsyncMock(return_value="Want me to go ahead?")
+        with patch("conversation.api.extract_capability_invocation", new=AsyncMock(return_value=candidate)), \
+             patch("conversation.api.complete_json", new=AsyncMock(
+                 return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": True})), \
+             patch("conversation.api.complete", new=reply_mock):
+            outcome = await handle("write hello to notes.txt")
+
+        assert len(outcome.pending_capability_invocations) == 1
+        prompt_used = reply_mock.call_args.kwargs["prompt"]
+        assert "fs.write" in prompt_used and "awaiting the user's y/N confirmation" in prompt_used
+        assert "JUST EXECUTED this turn" not in prompt_used  # not executed yet — still pending
+
+
+async def test_capability_invocation_no_goal_match_relayed_not_framed_as_fact():
+    await set_mission(title="Grow", statement="Statement.")
+
+    candidate = CapabilityInvocationCandidate(
+        capability_id="goals.advance", raw_user_text="touch my nonexistent goal",
+        goal_ref="Nonexistent Goal", resolved_goal_id=None, match_count=0,
+    )
+    reply_mock = AsyncMock(return_value="Which goal did you mean?")
+    with patch("conversation.api.extract_capability_invocation", new=AsyncMock(return_value=candidate)), \
+         patch("conversation.api.complete_json", new=AsyncMock(
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": True})), \
+         patch("conversation.api.complete", new=reply_mock):
+        outcome = await handle("touch my nonexistent goal")
+
+    assert outcome.pending_capability_invocations == []
+    # A clarify question is NOT a completed fact — must land in the
+    # relay_note block, never the "Action just taken this turn" one
+    # (2026-08-26 dogfooding bug class, re-verified here for V1-M4).
+    prompt_used = reply_mock.call_args.kwargs["prompt"]
+    assert "isn't finished yet" in prompt_used
+    assert "Action just taken this turn" not in prompt_used
+    assert "couldn't find a goal" in prompt_used
 
 
 # --- regression: 2026-08-27 dogfooding, round 2 -------------------------
@@ -1157,7 +1317,7 @@ async def test_cancel_confirmation_relay_note_neither_denies_capability_nor_clai
 
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         outcome = await handle("delete the Test goal")
 
@@ -1189,7 +1349,7 @@ async def test_mission_change_confirmation_relay_note_neither_denies_capability_
 
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         outcome = await handle("change my mission to Test mission: test")
 
@@ -1227,7 +1387,7 @@ async def test_execute_framing_instructs_a_just_done_action_not_a_preexisting_fa
 
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         await handle("make the exam overloaded goal active")
 
@@ -1244,7 +1404,7 @@ async def test_mission_change_asks_confirmation_and_writes_new_version_on_approv
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Confirm the mission change?")):
         outcome = await handle("change my mission to Ship: Ship real things.")
 
@@ -1269,7 +1429,7 @@ async def test_ambiguous_goal_reference_asks_clarify_and_writes_nothing():
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Which goal did you mean?")):
         outcome = await handle("pause my goal")
 
@@ -1291,7 +1451,7 @@ async def test_invalid_transition_rejected_without_writing():
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Can't do that.")):
         outcome = await handle("pause build jarvis")
 
@@ -1314,7 +1474,7 @@ async def test_state_change_grounding_reaches_the_prompt():
 
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         await handle("create a goal to run a marathon")
 
@@ -1337,7 +1497,7 @@ async def test_state_change_and_memory_can_both_fire_from_one_message():
     with patch("conversation.api.extract_candidates", new=AsyncMock(return_value=[memory_candidate])), \
          patch("conversation.api.extract_state_change", new=AsyncMock(return_value=state_candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": True, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Got it, and done.")):
         await handle("I'm Yochan, create a goal to run a marathon")
 
@@ -1373,7 +1533,7 @@ async def test_create_goal_without_type_relays_the_clarifying_question_not_a_fac
 
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         outcome = await handle("could you add a new goal named exam overloaded")
 
@@ -1409,7 +1569,7 @@ async def test_invalid_transition_relays_explanation_not_a_fact_claim():
 
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         await handle("pause build jarvis")
 
@@ -1447,7 +1607,7 @@ async def test_relay_note_framing_does_not_instruct_a_capability_denial():
 
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         await handle("could you add one more goal named exam overloaded")
 
@@ -1489,7 +1649,7 @@ async def test_recent_conversation_reaches_routing_and_extraction_for_a_followup
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=turn1_candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(
              return_value="What kind of goal would exam overloaded be — a Task, Habit, Project, or LifeGoal?")):
         await handle("could you add one more goal named exam overloaded")
@@ -1502,7 +1662,7 @@ async def test_recent_conversation_reaches_routing_and_extraction_for_a_followup
     async def fake_route_complete_json(system, prompt, **kwargs):
         if system == _ROUTING_SYSTEM:
             routing_calls.append(prompt)
-            return {"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True}
+            return {"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False}
         return None
 
     turn2_candidate = StateChangeCandidate(
@@ -1553,7 +1713,7 @@ async def test_goals_still_visible_to_reasoning_after_a_confirmed_mission_change
     )
     with patch("conversation.api.extract_state_change", new=AsyncMock(return_value=mission_candidate)), \
          patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True})), \
+             return_value={"needs_reasoning": False, "memory_candidate_possible": False, "state_change_possible": True, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(return_value="Want me to go ahead?")):
         outcome1 = await handle("change my mission to New Mission: different")
     await resolve_pending_state_change(outcome1.pending_state_changes[0], approved=True)
@@ -1571,7 +1731,7 @@ async def test_goals_still_visible_to_reasoning_after_a_confirmed_mission_change
         return "You have one active goal: Build Jarvis."
 
     with patch("conversation.api.complete_json", new=AsyncMock(
-             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False})), \
+             return_value={"needs_reasoning": True, "memory_candidate_possible": False, "state_change_possible": False, "capability_invocation_possible": False})), \
          patch("conversation.api.complete", new=AsyncMock(side_effect=fake_complete)):
         await handle("list my goals")
 

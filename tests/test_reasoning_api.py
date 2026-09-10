@@ -5,10 +5,12 @@ caching, flat budget) behave sensibly, not that they're sophisticated."""
 import pytest
 from unittest.mock import AsyncMock, patch
 
+import json
+
 from contracts.enums import GoalStatus, GoalType, MemoryType, Priority
 from goals.api import create_goal, set_status
 from memory.api import create_memory
-from mission.api import set_mission
+from mission.api import get_active_mission, set_mission
 from reasoning.api import (
     NoActiveMissionError,
     UnknownIntentError,
@@ -221,6 +223,37 @@ def test_guard_ignores_generic_mission_mention_with_no_conflation():
     assert _asserts_wrong_mission("Your mission is going well!", mission, items) is False
 
 
+# --- 2026-08-28: whole-text co-occurrence blind spot, exposed by the
+# same day's mission.statement fix. Once the model could correctly
+# discuss the Mission by quoting its statement instead of repeating its
+# title, an otherwise-accurate, multi-paragraph reply that separately
+# names Cancelled goals elsewhere started tripping this guard — "mission"
+# and a goal title both appeared SOMEWHERE in a long reply, which used
+# to be treated as conflation regardless of whether they were anywhere
+# near each other.
+
+def test_guard_allows_statement_quote_and_goal_names_in_different_sentences():
+    mission = type("M", (), {"title": "Build a life you are proud"})()
+    items = [_fake_goal_item("Make a game", status="Cancelled"), _fake_goal_item("Test", status="Cancelled")]
+    live_reply = (
+        "If you're certain the goals no longer align with your mission "
+        "(\"improve your financial standing, health, relationships, and "
+        "intellectual growth\"), removing them can keep your goal list clean. "
+        "For example, \"Make a game\" might develop technical or creative "
+        "skills that support that area."
+    )
+    assert _asserts_wrong_mission(live_reply, mission, items) is False
+
+
+def test_guard_still_rejects_conflation_scoped_to_a_single_sentence():
+    # Confirms the sentence-level rewrite didn't lose detection just
+    # because the conflating sentence sits among other, unrelated ones.
+    mission = type("M", (), {"title": "I wanna be Ironman"})()
+    items = [_fake_goal_item("Build jarvis v1")]
+    bad = "Here's your update. Your active mission is to Build jarvis v1. Anything else?"
+    assert _asserts_wrong_mission(bad, mission, items) is True
+
+
 async def test_reason_falls_back_to_template_when_llm_conflates_goal_with_mission():
     # Real bug, real query shape: user asks about "missions," Mission
     # title was never in the LLM's evidence before this fix, so it
@@ -305,6 +338,84 @@ def test_status_guard_allows_accurate_multi_goal_mention_in_separate_sentences()
 def test_status_guard_still_rejects_same_sentence_violation_with_other_goals_present():
     # Confirms the sentence-level rewrite didn't lose the original bug's
     # detection just because a third, unrelated goal is also in scope.
+    items = [
+        _fake_goal_item("Build jarvis", status="Draft"),
+        _fake_goal_item("complete an ironman race", status="Draft"),
+    ]
+    bad = "You have two active goals: Build jarvis and complete an ironman race."
+    assert _asserts_wrong_status(bad, items) is True
+
+
+# --- 2026-08-27: negation blind spot, found via live dogfooding once
+# gather_grounded_evidence started returning real, multi-status goal
+# lists (see this file's mission.identity_id bug entry, same date) —
+# with empty evidence there was never a real non-active title for this
+# guard to co-occur with, so this blind spot had nothing to trigger it
+# until that fix landed. The natural way to accurately summarize five
+# goals of mixed status in one sentence is almost always exactly the
+# pattern that used to get rejected: name the active ones, then say the
+# rest are NOT active.
+
+def test_status_guard_allows_accurate_negated_active_claim_same_sentence():
+    items = [
+        _fake_goal_item("exam overloaded", status="Active"),
+        _fake_goal_item("Build Jarvis", status="Active"),
+        _fake_goal_item("Make a game", status="Cancelled"),
+        _fake_goal_item("Test", status="Cancelled"),
+        _fake_goal_item("Run an ironman run", status="Draft"),
+    ]
+    accurate = (
+        "Your active goals are exam overloaded and Build Jarvis, while Make a "
+        "game, Test, and Run an ironman run are not currently active."
+    )
+    assert _asserts_wrong_status(accurate, items) is False
+
+
+def test_status_guard_allows_accurate_isnt_active_phrasing():
+    items = [_fake_goal_item("Make a game", status="Cancelled"), _fake_goal_item("Build Jarvis", status="Active")]
+    accurate = "Make a game isn't active right now, but Build Jarvis is."
+    assert _asserts_wrong_status(accurate, items) is False
+
+
+def test_status_guard_negation_fix_did_not_reopen_the_original_bug():
+    # The negation check must not accidentally swallow the exact
+    # original 2026-08-14 violation just because some unrelated
+    # negation-flavored word appears nearby.
+    items = [
+        _fake_goal_item("Build jarvis", status="Draft"),
+        _fake_goal_item("complete an ironman race", status="Draft"),
+    ]
+    bad = "You have two active goals: Build jarvis and complete an ironman race."
+    assert _asserts_wrong_status(bad, items) is True
+
+
+# --- 2026-08-29: hypothetical/modal blind spot, a different shape from
+# the negation one above. "we can update their status back to Active"
+# answers "what can I do with a cancelled goal?" by correctly
+# describing a FUTURE OPTION, not claiming current status — no negation
+# word is present, so the 2026-08-27 fix doesn't cover it. This is
+# close to unavoidable for exactly the questions V1-M2's status-change
+# feature invites people to ask.
+
+def test_status_guard_allows_hypothetical_reactivation_offer():
+    items = [
+        _fake_goal_item("Make a game", status="Cancelled"),
+        _fake_goal_item("Test", status="Cancelled"),
+    ]
+    live_reply = (
+        "If your priorities change in the future and you want to pick up \"Make a game\" "
+        "or \"Test\" again, we can update their status back to Active or Draft to start "
+        "tracking them actively."
+    )
+    assert _asserts_wrong_status(live_reply, items) is False
+
+
+def test_status_guard_allows_a_different_hypothetical_phrasing():
+    items = [_fake_goal_item("Test", status="Cancelled")]
+    assert _asserts_wrong_status("You could make Test active again whenever you're ready.", items) is False
+
+
+def test_status_guard_hypothetical_fix_did_not_reopen_the_original_bug():
     items = [
         _fake_goal_item("Build jarvis", status="Draft"),
         _fake_goal_item("complete an ironman race", status="Draft"),
@@ -444,3 +555,73 @@ async def test_gather_grounded_evidence_finds_goals_created_both_before_and_afte
 
     assert "Created before the change" in evidence
     assert "Created after the change" in evidence
+
+
+# --- regression: 2026-08-28 dogfooding ----------------------------------
+# Live session: "what's the statement?" answered with the MISSION TITLE,
+# verbatim, as if it were the statement. Root cause, confirmed by
+# printing the real evidence string for this exact scenario before
+# fixing anything: _build_structured_evidence's "mission" object only
+# ever included {"title": mission.title} — mission.statement was never
+# serialized into evidence AT ALL, for any reasoning-routed question,
+# since this function was written. Same failure shape as the
+# 2026-08-10 fix a few lines above in the same function (no real
+# Mission data -> the model confidently relabels the nearest
+# similar-looking text instead of saying it doesn't know) — that fix
+# added the title; it just never occurred to also add the statement.
+
+async def test_gather_grounded_evidence_includes_the_real_statement_not_just_the_title():
+    await set_mission(
+        title="Build a life you are proud",
+        statement="Wake up early, ship real work, and stop settling for average days.",
+    )
+    mission = await get_active_mission()
+
+    context_items, evidence = await gather_grounded_evidence(mission)
+
+    assert "Wake up early, ship real work" in evidence
+
+
+# --- regression: 2026-08-29 dogfooding ----------------------------------
+# Live session: "what can I do with a cancelled goal?" (a reasoning-
+# routed, purely informational question) answered "we can change its
+# status back to Active or Draft" — Cancelled is terminal
+# (goals.api.ALLOWED_TRANSITIONS[CANCELLED] == set()), so that's not
+# imprecise, it's false. Two turns later, actually trying the change
+# was correctly REJECTED by state_change/policy.py, which reads the
+# same real table — a flat, visible self-contradiction from the user's
+# side, even though neither individual turn was "lying": two different
+# code paths were answering the same question from two different
+# information sources, and only one was ever connected to the truth.
+# Root cause: gather_grounded_evidence never included a goal's real
+# valid next statuses at all, so the conversational path had nothing
+# but a guess to offer. Fixed by serializing
+# goals.api.ALLOWED_TRANSITIONS (the exact table the policy layer
+# already enforces) into each goal's evidence — one source of truth
+# for both paths, not two independent ones that can disagree.
+
+async def test_gather_grounded_evidence_includes_real_transition_options_for_a_terminal_status():
+    await set_mission(title="Grow", statement="Statement.")
+    goal = await create_goal(type=GoalType.PROJECT, title="Make a game")
+    await set_status(goal.id, GoalStatus.ACTIVE, reason="setup")
+    await set_status(goal.id, GoalStatus.CANCELLED, reason="setup")
+    mission = await get_active_mission()
+
+    context_items, evidence = await gather_grounded_evidence(mission)
+    data = json.loads(evidence)
+
+    cancelled = next(g for g in data["goals"] if g["title"] == "Make a game")
+    assert cancelled["status"] == "Cancelled"
+    assert cancelled["possible_next_statuses"] == []
+
+
+async def test_gather_grounded_evidence_includes_real_transition_options_for_a_non_terminal_status():
+    await set_mission(title="Grow", statement="Statement.")
+    await create_goal(type=GoalType.TASK, title="A brand new draft goal")
+    mission = await get_active_mission()
+
+    context_items, evidence = await gather_grounded_evidence(mission)
+    data = json.loads(evidence)
+
+    draft = next(g for g in data["goals"] if g["title"] == "A brand new draft goal")
+    assert set(draft["possible_next_statuses"]) == {"Active", "Archived", "Cancelled"}

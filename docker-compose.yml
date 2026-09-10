@@ -17,5 +17,75 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # ⚠ KNOWN BROKEN as of 2026-09-05 — do not rely on this service.
+  # Root cause: @modelcontextprotocol/sdk has a regression (any 1.x
+  # release pulled by nspady's own "^1.27.0" package.json range) that
+  # breaks this server's stateless HTTP transport after its first
+  # request — confirmed by direct reproduction, independent of Docker
+  # or Jarvis entirely. Fix is an exact SDK pin ("1.24.3") applied to a
+  # LOCAL clone of the server's package.json before building — NOT
+  # applicable here as-is, since `build.context` below points straight
+  # at nspady's own unpatched repo/Dockerfile with no way to inject that
+  # edit mid-build. The currently working, currently tested path is a
+  # plain native `node build/index.js` process (patched, pinned) run
+  # directly on the host — NOT this Docker service. See
+  # V1_M5_IMPLEMENTATION_RECORD.md's "calendar-mcp's real root cause"
+  # section for the full story before touching this again. Bringing
+  # this service back to parity would mean switching `build.context` to
+  # a local Dockerfile that clones the repo, seds the SDK pin into
+  # package.json, then builds — not attempted here.
+  #
+  # M5: real Google Calendar via MCP. Built locally from nspady's
+  # community server (github.com/nspady/google-calendar-mcp) — NOT
+  # Google's own calendarmcp.googleapis.com, which is Developer Preview
+  # (not GA) as of this milestone's planning; the community server is at
+  # a stable tagged release and runs locally, matching this project's
+  # local-first / no-cloud-infra stance the same way Postgres above does.
+  #
+  # HTTP transport + 127.0.0.1-only binding (NOT 0.0.0.0 on the host side)
+  # is a deliberate trade-off, not an oversight: upstream's own docs
+  # recommend stdio for "production" and call HTTP mode unauthenticated/
+  # dev-only, but stdio is a 1:1 pipe per client process and doesn't fit
+  # a long-running docker-compose service the way Postgres's connection
+  # pool does. Binding the published port to loopback only accepts the
+  # same local trust boundary this repo already accepts for Postgres
+  # above (reachable on localhost with a fixed dev password, no TLS) —
+  # revisit if Jarvis ever runs anywhere other than the person's own
+  # machine.
+  #
+  # Requires local verification: not run inside this sandbox (no Docker
+  # Hub / arbitrary image registry or git-clone-as-build-context access
+  # in the network allowlist, matching the Postgres service's own comment
+  # above).
+  calendar-mcp:
+    build:
+      context: https://github.com/nspady/google-calendar-mcp.git#v2.6.1
+    # network_mode: host (Linux only — this repo's HTTP transport reuses
+    # the same HOST value both to bind its listener AND to build the
+    # OAuth redirect_uri it hands to Google (src/transports/http.ts,
+    # src/config/TransportConfig.ts — verified against the actual
+    # v2.6.1 source, not just docs). There's no separate "public
+    # callback host" setting upstream. HOST=0.0.0.0 (needed for a
+    # published-port container to be reachable at all) therefore leaks
+    # into the redirect_uri as literally "0.0.0.0", which Google
+    # rejects outright as an invalid destination. Host networking sidesteps
+    # this: the container's 127.0.0.1 IS the machine's real loopback, so
+    # HOST=127.0.0.1 is simultaneously correct for both binding and the
+    # redirect_uri, and no `ports:` publish step is needed at all.
+    # NOT portable to Docker Desktop (macOS/Windows), where host
+    # networking doesn't expose the container the same way — revisit
+    # with an explicit `ports:` + accepting a real routable HOST value
+    # if this ever needs to run there.
+    network_mode: "host"
+    environment:
+      TRANSPORT: http
+      HOST: 127.0.0.1
+      PORT: ${CALENDAR_MCP_PORT:-3000}
+      GOOGLE_OAUTH_CREDENTIALS: /credentials/gcp-oauth.keys.json
+      GOOGLE_CALENDAR_MCP_TOKEN_PATH: /credentials/tokens.json
+    volumes:
+      - ./data/google_calendar:/credentials
+
 volumes:
   jarvis_pg_data:

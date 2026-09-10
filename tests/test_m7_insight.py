@@ -77,3 +77,37 @@ async def test_user_response_is_the_only_mutable_field():
     updated = await record_user_response(record.id, "Agreed, adjusting next week.")
     assert updated.user_response == "Agreed, adjusting next week."
     assert updated.narrative == record.narrative  # everything else untouched
+
+
+# --- 2026-08-27: misaligned-goals check deliberately disabled ----------
+# See ARCHITECTURE_ISSUES.md's matching entry. This used to compare
+# g.mission_id against mission.id (the current Mission VERSION row's own
+# id) instead of mission.identity_id (the stable id Goal actually
+# stores), so it flagged EVERY active goal as "misaligned" the instant a
+# mission was ever superseded — even a goal created five minutes
+# earlier under the same, still-current Mission. Turned into a
+# deliberate no-op (compare against identity_id, which Goal always
+# matches) rather than given a real fix, because a real fix needs data
+# Goal doesn't record (which mission version was active at creation
+# time) — see the code comment in insight/api.py's _gather_evidence.
+# This test protects the "always empty, on purpose" state: if someone
+# reverts to comparing against mission.id without reading why, this
+# fails and points back here instead of silently reintroducing the
+# false-positive-on-every-supersession bug.
+
+async def test_misaligned_goals_check_stays_a_noop_after_a_mission_supersession():
+    await set_mission(title="Grow", statement="Original.")
+    goal = await create_goal(type=GoalType.PROJECT, title="Build Jarvis")
+    await set_goal_status(goal.id, GoalStatus.ACTIVE, reason="setup")
+
+    await set_mission(title="New Mission", statement="Different statement.")
+    # A goal created fresh under the now-current mission too — if the
+    # old bug were present, BOTH this and the one above would wrongly
+    # get flagged as "misaligned".
+    fresh = await create_goal(type=GoalType.PROJECT, title="Created after the change")
+    await set_goal_status(fresh.id, GoalStatus.ACTIVE, reason="setup")
+
+    record = await generate_insight(InsightMode.REFLECTION)
+
+    assert not any("since been superseded" in p for p in record.problems)
+    assert not any("since been superseded" in c.claim for c in record.evidence)

@@ -68,7 +68,21 @@ async def test_confirmation_required_action_pauses_and_resumes():
     action = await get_action(risky_action.id)
     assert action.status == ActionStatus.READY  # reached Ready, blocked before Running
 
-    capability_result = await resume_action(pcr.id, approved=True)
+    # Merge fix (2026-09-06): this test predates M5's real calendar-mcp
+    # implementation — calendar.create_event was chosen purely as an
+    # arbitrary stand-in for "some registered capability with
+    # higher-than-LOW risk" to exercise Orchestrator's own confirm/resume
+    # gating (see module docstring), back when that capability's
+    # placeholder implementation had no real side effects to worry
+    # about. M5 replaced it with a real MCP tool call, so resuming this
+    # action now genuinely tries to reach a live calendar-mcp server —
+    # nothing in this sandbox (or most CI environments) has one running,
+    # so this must be mocked the same way M5's own calendar tests mock
+    # it (tests/test_m5_capabilities.py), at the calendar_ops import
+    # site, not infra.mcp_client itself.
+    from unittest.mock import AsyncMock, patch
+    with patch("capabilities.primitives.calendar_ops.call_calendar_tool", new=AsyncMock(return_value={"id": "evt-merge-test"})):
+        capability_result = await resume_action(pcr.id, approved=True)
     assert capability_result.success is True
     action_after = await get_action(risky_action.id)
     assert action_after.status == ActionStatus.COMPLETED

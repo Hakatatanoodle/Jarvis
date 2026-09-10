@@ -5,3 +5,12 @@ httpx>=0.27
 python-dotenv>=1.0
 pytest>=8.0
 pytest-asyncio>=0.24
+# M5: MCP client for Google Calendar (infra/mcp_client.py). Pinned to the
+# range verified against PyPI on 2026-08-30 (latest at pin time: 2.1.1) —
+# the SDK's transport-layer import names have moved before (see
+# infra/mcp_client.py's module docstring) and were NOT reachable from this
+# build sandbox to exercise live against a running server. Re-verify
+# infra/mcp_client.py's imports against whatever version resolves here
+# before this ships, same "local verification required" discipline
+# infra/llm_router.py already documents for its own provider calls.
+mcp>=1.9,<3.0

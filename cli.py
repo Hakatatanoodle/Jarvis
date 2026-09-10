@@ -329,6 +329,15 @@ async def _handle_request(text: str):
         if status:
             print(f"    -> {status}")
 
+    # V1-M4: same y/N shape again, for a natural-language Capability
+    # invocation that came back CONFIRMATION_REQUIRED from the real
+    # permission check (see capability_invocation.dispatch.PendingCapabilityConfirmation).
+    for pci in conv_outcome.pending_capability_invocations:
+        answer = input(f"  ? {pci.reason} ")
+        status = await conversation.api.resolve_pending_capability_invocation(pci, approved=answer.strip().lower() == "y")
+        if status:
+            print(f"    -> {status}")
+
 
 async def main():
     await _bootstrap()

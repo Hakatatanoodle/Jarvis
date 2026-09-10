@@ -191,10 +191,14 @@ def _validate(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None  # unreachable given the _VALID_OPS check above; kept as an explicit backstop
 
 
-def _resolve_goal_ref(goal_ref: str, known_goals: list[tuple[str, str, str]]) -> tuple[list[str], Optional[str]]:
+def resolve_goal_ref(goal_ref: str, known_goals: list[tuple[str, str, str]]) -> tuple[list[str], Optional[str]]:
     """Exact, case-insensitive match only — no fuzzy matching (see
     module docstring). Returns (matched_ids, status_of_the_single_match
-    if exactly one)."""
+    if exactly one).
+
+    Made public (V1-M4) so capability_invocation/extraction.py can reuse
+    this exact entity-resolution logic unchanged rather than duplicating
+    it — same goal_ref shape, same "exact match or ask" discipline."""
     matches = [(gid, status) for title, gid, status in known_goals if title.strip().lower() == goal_ref.lower()]
     ids = [gid for gid, _status in matches]
     status = matches[0][1] if len(matches) == 1 else None
@@ -233,7 +237,7 @@ async def extract_candidate(
         )
 
     if op is StateChangeOperation.SET_GOAL_STATUS:
-        matched_ids, matched_status = _resolve_goal_ref(validated["goal_ref"], known_goals)
+        matched_ids, matched_status = resolve_goal_ref(validated["goal_ref"], known_goals)
         return StateChangeCandidate(
             operation=op, raw_user_text=user_text, confidence=validated["confidence"],
             goal_ref=validated["goal_ref"],

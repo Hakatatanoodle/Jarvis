@@ -73,8 +73,22 @@ async def _gather_evidence(since: datetime) -> dict:
     completed_goals = [g for g in goals if g.completed_at and g.completed_at >= since]
 
     mission = await get_active_mission()
+    # DISABLED, not fixed — 2026-08-27, see ARCHITECTURE_ISSUES.md's
+    # matching entry. This used to compare against `mission.id` (the
+    # current Mission VERSION row's own id), which made it fire for
+    # EVERY active goal the instant a mission was ever superseded —
+    # the same id/identity_id mix-up fixed for real in
+    # reasoning/api.py's gather_grounded_evidence, but NOT fixable the
+    # same way here: this check's whole premise (flag goals created
+    # under a stale mission version) needs data Goal never records —
+    # which mission version was active at creation time. Comparing
+    # against `mission.identity_id` instead doesn't implement that
+    # premise, it just makes the condition permanently False (Goal only
+    # ever stores identity_id, so it always equals this), which is a
+    # deliberate, explicit no-op — always empty, on purpose — until a
+    # real fix is designed, rather than a check that's always wrong.
     misaligned_goals = [
-        g for g in goals if g.status == GoalStatus.ACTIVE and mission and g.mission_id != mission.id
+        g for g in goals if g.status == GoalStatus.ACTIVE and mission and g.mission_id != mission.identity_id
     ]
 
     return {

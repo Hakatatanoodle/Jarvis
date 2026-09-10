@@ -28,6 +28,7 @@ from uuid import uuid4
 from config.loader import load_config
 from contracts.decision import Decision
 from contracts.enums import ContextSourceType, GoalStatus
+from goals.api import ALLOWED_TRANSITIONS
 from infra.llm_router import complete_json
 from infra.logging import get_logger
 from infra.storage import connection
@@ -242,7 +243,29 @@ def _build_structured_evidence(context_items, mission) -> str:
     wrong, but stated with full confidence, which is worse than the old
     honest "insufficient information" failure it replaced. Same fix
     shape as BUG-M6-01: give the real object explicitly instead of
-    leaving a gap for the model to fill in."""
+    leaving a gap for the model to fill in.
+
+    Fix (2026-08-29, found in dogfooding — the most consequential
+    version of this exact pattern yet): a goal's real valid next
+    statuses were never included here either. Asked "what can I do with
+    a cancelled goal?", the model had NOTHING authoritative to draw
+    from and confidently invented a plausible-sounding but WRONG answer
+    ("we can change its status back to Active or Draft") — Cancelled is
+    terminal (goals.api.ALLOWED_TRANSITIONS[CANCELLED] == set()), so
+    that's not just imprecise, it's flatly false. Worse than the
+    Mission case: the person then tried to act on it ("reactivate it to
+    draft"), and state_change/policy.py — reading the SAME
+    ALLOWED_TRANSITIONS table, correctly this time, since that layer
+    always had it — rejected it as an invalid transition, flatly
+    contradicting what the conversational answer had just told them two
+    turns earlier. The system was never lying or "messing around" in
+    either turn individually; two different code paths were answering
+    the same kind of question from two different information sources,
+    and only one of them was ever connected to the truth. Now both are:
+    every goal's evidence includes its real 'possible_next_statuses',
+    computed from the exact same ALLOWED_TRANSITIONS table
+    state_change/policy.py enforces — one source of truth, not two
+    independent guesses that can disagree."""
     goal_items = [i for i in context_items if i.source_type == ContextSourceType.GOAL]
     memory_items = [i for i in context_items if i.source_type == ContextSourceType.MEMORY]
     ids_in_context = {i.source_id for i in goal_items}
@@ -255,17 +278,23 @@ def _build_structured_evidence(context_items, mission) -> str:
         if parent and parent in ids_in_context:
             rels.append(f"parent_of:{parent}")
         rels += [f"depends_on:{d}" for d in deps]
+        status_str = i.payload.get("status")
+        try:
+            next_statuses = sorted(s.value for s in ALLOWED_TRANSITIONS.get(GoalStatus(status_str), set()))
+        except ValueError:
+            next_statuses = []  # unrecognized status string — fail closed to "no known options", never guess
         goals_block.append({
             "id": i.source_id,
             "title": i.payload.get("title"),
-            "status": i.payload.get("status"),
+            "status": status_str,
+            "possible_next_statuses": next_statuses,
             "relationships": rels,
         })
 
     memories_block = [{"summary": i.reasoning} for i in memory_items]
 
     return json.dumps({
-        "mission": {"title": mission.title},
+        "mission": {"title": mission.title, "statement": mission.statement},
         "goals": goals_block,
         "memories": memories_block,
         "relationship_note": (
@@ -273,9 +302,29 @@ def _build_structured_evidence(context_items, mission) -> str:
             "of its known relationships. An empty list means no known "
             "relationship exists between that goal and any other goal here."
         ),
+        "status_note": (
+            "A goal's 'possible_next_statuses' list is the complete, "
+            "authoritative set of statuses it could actually be moved to — "
+            "the exact same rule this system enforces when a real status "
+            "change is attempted, not a guess. An empty list means that "
+            "status is TERMINAL: no further status change is possible, full "
+            "stop, no matter how the user phrases the question ('can I make "
+            "it active again', 'what can I do with it'). Never state or "
+            "imply a goal could move to a status that isn't in its own "
+            "'possible_next_statuses' list."
+        ),
         "mission_note": (
-            "The 'mission' object above is the user's one and only Mission. "
-            "None of the entries under 'goals' are the Mission, even if the "
+            "The 'mission' object above is the user's one and only Mission, "
+            "with its real title AND real statement — two distinct fields, "
+            "never the same text unless the user genuinely set them that "
+            "way. If asked for the statement specifically, use the "
+            "'statement' field, never the title (see this file's "
+            "2026-08-28 mission-statement bug entry: before this field "
+            "existed here at all, a 'what's the statement' question had "
+            "no statement text anywhere in evidence, so the model just "
+            "confidently repeated the title instead — same failure shape "
+            "as the 2026-08-10 fix just above, one field over). None of "
+            "the entries under 'goals' are the Mission, even if the "
             "user's question uses the word 'mission' — a Goal and the "
             "Mission are never the same thing."
         ),
@@ -367,7 +416,32 @@ def _asserts_wrong_mission(text: str, mission, context_items) -> bool:
     it: text talks about 'mission' but never actually contains the real
     Mission title, while a Goal title is present instead — the exact
     conflation signature. Same cost trade-off as the other guards here:
-    a false rejection just falls back to the always-safe template."""
+    a false rejection just falls back to the always-safe template.
+
+    Revision 2026-08-28: after the same day's fix that finally put
+    mission.statement into evidence (see this file's dedicated entry),
+    the model gained a whole new, completely correct way to talk about
+    the Mission WITHOUT ever repeating its title — by quoting or
+    paraphrasing the statement instead. A reply doing exactly that,
+    while ALSO naming specific Cancelled goals elsewhere in an
+    otherwise normal, multi-paragraph answer ("if the goals no longer
+    align with your mission ('improve your financial standing,
+    health...'), removing them keeps things clean... Make a game might
+    develop skills that support that area") was flagged as conflation —
+    "mission" and a goal title both appeared somewhere in the text, the
+    same crude whole-text co-occurrence check the 2026-08-14 status
+    guard had before its own sentence-level fix. Restricted to the
+    same per-sentence scoping that fix already established: only a
+    genuine same-sentence co-occurrence — "Make a game" and "mission" in
+    one sentence together — still counts. Accurately discussing a
+    Mission and separately, elsewhere, discussing named goals is
+    completely ordinary and must not require repeating the literal
+    title to be believed. Known, accepted limitation, same trade-off
+    as always: a sentence that legitimately combines a real goal title
+    with "mission" without conflating them ("Make a game doesn't align
+    with your mission") would still be flagged — not yet observed in
+    practice, so not chased pre-emptively; the cost is the same safe
+    fallback, not a wrong answer reaching the user."""
     lowered = text.lower()
     if "mission" not in lowered:
         return False
@@ -375,8 +449,32 @@ def _asserts_wrong_mission(text: str, mission, context_items) -> bool:
         return False  # correctly used the real title somewhere
 
     goal_items = [i for i in context_items if i.source_type == ContextSourceType.GOAL]
-    titles = [i.payload.get("title", "") for i in goal_items if i.payload.get("title")]
-    return any(t.lower() in lowered for t in titles if t)
+    titles = [i.payload.get("title", "").lower() for i in goal_items if i.payload.get("title")]
+    if not titles:
+        return False
+
+    for sentence in re.split(r"(?<=[.!?\n])\s+", lowered):
+        if "mission" not in sentence:
+            continue
+        if any(t in sentence for t in titles):
+            return True
+    return False
+
+
+_NEGATED_ACTIVE = re.compile(
+    r"\b(?:not|n't|no longer|isn't|aren't|wasn't|weren't|never)\b(?:\s+\S+){0,4}\s+active\b"
+)
+# 2026-08-29: same idea as _NEGATED_ACTIVE, different failure shape —
+# "we can update their status back to Active" is a HYPOTHETICAL offer
+# of a future change, not a claim about the goal's current status. A
+# question like "what can I do with a cancelled goal?" almost has to be
+# answered this way (naming Active as a possible future state), so this
+# isn't a rare phrasing — it's the natural, correct shape of answering
+# exactly the question V1-M2's status-change feature invites people to
+# ask. See _asserts_wrong_status's matching revision note.
+_HYPOTHETICAL_ACTIVE = re.compile(
+    r"\b(?:can|could|would|may|might|will|should)\b(?:\s+\S+){0,8}\s+active\b"
+)
 
 
 def _asserts_wrong_status(text: str, context_items) -> bool:
@@ -414,7 +512,47 @@ def _asserts_wrong_status(text: str, context_items) -> bool:
     non-active goal's title must appear in the SAME sentence to count,
     matching the original bug's own construction ("You have two active
     goals: Build jarvis and complete an ironman race." — one sentence)
-    without flagging accurate separate mentions."""
+    without flagging accurate separate mentions.
+
+    Revision 2026-08-27: a fully ACCURATE sentence — "Your active goals
+    are exam overloaded and Build Jarvis, while Make a game, Test, and
+    Run an ironman run are not currently active." — was tripping this
+    guard on every call, because it only checked whether "active" and a
+    non-active goal's title shared a sentence, never whether that
+    occurrence of "active" was negated. This exact blind spot existed
+    from the start but had nothing to trigger it until
+    gather_grounded_evidence started returning real, multi-status goal
+    lists (see this file's dedicated bug entry, same date) — with
+    empty evidence, there was never a real non-active title for this
+    check to co-occur with in the first place. The natural way to
+    accurately summarize several goals of mixed status in one sentence
+    is almost always exactly this pattern: name the active ones, then
+    say the rest are NOT active — which is precisely what this guard
+    used to reject. Now skips a sentence where "active" is clearly
+    negated. Same cost trade-off this guard has used at every prior
+    revision: a missed detection still only costs an unnecessarily
+    generated reply the fallback would have covered anyway; a false
+    rejection was actively making correct answers indistinguishable
+    from wrong ones, every single time, once real data existed.
+
+    Revision 2026-08-29: a second, different blind spot — "we can
+    update their status back to Active or Draft" — answering "what can
+    I do with a cancelled goal?" by correctly describing a HYPOTHETICAL
+    future option, not claiming the goal is active now. No negation
+    word is present, so the 2026-08-27 fix didn't cover it; this is a
+    modal/conditional verb (can/could/would/may/might/will/should)
+    preceding "active" instead of a negation preceding it. Exactly the
+    kind of question V1-M2's status-change feature invites — "what
+    statuses can I move X to", "can I make it active again" — is one a
+    correct answer can barely avoid phrasing this way, so this wasn't a
+    rare edge case, it was close to guaranteed to recur. Known, accepted
+    limitation, same trade-off as every revision here: tested directly
+    and confirmed this also lets through "You can see that Build jarvis
+    is active" even when that's a genuine false claim — the modal verb
+    there governs "see", not a change of state, but this check can't
+    tell the difference. Not observed in real dogfooding traffic; not
+    chased pre-emptively for the same reason the mission guard's
+    analogous gap wasn't."""
     lowered = text.lower()
     if not re.search(r"\bactive\b", lowered):
         return False
@@ -431,8 +569,13 @@ def _asserts_wrong_status(text: str, context_items) -> bool:
     for sentence in re.split(r"(?<=[.!?\n])\s+", lowered):
         if not re.search(r"\bactive\b", sentence):
             continue
-        if any(title in sentence for title in non_active):
-            return True
+        if not any(title in sentence for title in non_active):
+            continue
+        if _NEGATED_ACTIVE.search(sentence):
+            continue
+        if _HYPOTHETICAL_ACTIVE.search(sentence):
+            continue
+        return True
     return False
 
 

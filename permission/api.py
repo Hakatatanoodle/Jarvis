@@ -65,7 +65,18 @@ async def check_permission(action_id: str, capability: Capability) -> Permission
 
     computed_risk, risk_factors = compute_risk(capability, action)
 
-    if computed_risk in (RiskLevel.LOW, RiskLevel.MEDIUM):
+    if capability.force_confirmation:
+        # V1-M6: unconditional override (contracts/capability.py) — a
+        # capability that sets this always confirms, regardless of what
+        # the dynamic formula above computed. Checked before the normal
+        # threshold branches, deliberately bypassing them rather than
+        # feeding into compute_risk's ordinal math (a forced-High
+        # baseline could still tip to CRITICAL/DENIED once combined with
+        # other bumps, which is not what this override means).
+        permission_status = PermissionStatus.CONFIRMATION_REQUIRED
+        confirmation_status = ConfirmationStatus.PENDING
+        next_action_status = ActionStatus.READY
+    elif computed_risk in (RiskLevel.LOW, RiskLevel.MEDIUM):
         permission_status = PermissionStatus.GRANTED
         confirmation_status = ConfirmationStatus.NOT_APPLICABLE
         next_action_status = ActionStatus.READY

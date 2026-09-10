@@ -42,6 +42,17 @@ class MemoryType(str, Enum):
     CONSTRAINT = "Constraint"
 
 
+class ParamType(str, Enum):
+    """V1 generic-parameter mechanism (2026-09-07): the shape a
+    Capability.extra_parameters entry can declare. See
+    contracts/capability.py's ParamSpec docstring for the full
+    design rationale."""
+    STRING = "string"
+    ENUM = "enum"
+    DATETIME = "datetime"
+    BOOL = "bool"
+
+
 class Importance(str, Enum):
     LOW = "Low"
     MEDIUM = "Medium"

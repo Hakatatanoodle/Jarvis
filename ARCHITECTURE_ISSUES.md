@@ -1937,3 +1937,504 @@ traffic to confirm, same as the rest of this entry's siblings.
 goals question above (disable now via a one-line identity_id swap,
 redefine the check's meaning to fit the current schema, or add the
 version-snapshot field it actually needs).
+
+## [2026-08-27] insight/api.py's misaligned-goals check: disabled, not fixed
+
+**Decision made explicitly by the person running this system, not by
+me:** given a possible architecture revision is already being
+considered, don't design a real fix for this right now — just stop it
+from being actively wrong, and write down what a real fix would need
+for whoever picks this up (possibly during that revision).
+
+**What changed:** `insight/api.py`'s `_gather_evidence` compared
+`g.mission_id != mission.id` (previous entry's exact bug pattern — the
+current Mission VERSION row's own id, not the stable identity Goal
+actually stores). This made the "misaligned goals" claim
+("N active goal(s) reference a Mission version that's since been
+superseded") fire for EVERY active goal the instant a mission was ever
+superseded, including goals created seconds earlier under the current
+Mission. Changed to compare against `mission.identity_id` — which
+Goal's `mission_id` always equals, by construction — making this a
+deliberate, explicit, always-empty no-op instead of an always-wrong
+check.
+
+**Why this is a no-op and not a fix:** the claim this check is trying
+to support — "this goal predates your last Mission edit" — needs data
+that doesn't exist anywhere in the schema. `Goal` stores which Mission
+it belongs to (`identity_id`, stable across every edit), never which
+*version* of that Mission was active the moment the goal was created.
+There is currently no way to answer "is this goal older than the
+current Mission text" at all, correctly or incorrectly, with the data
+Goal records today.
+
+**What a real fix would need, for whoever picks this up:** a new field
+on Goal — something like `mission_version_at_creation: int`, set once
+at `goals.api.create_goal` time from the Mission's `version` at that
+moment — plus a genuine design decision on what "misaligned" should
+even mean for a goal (does editing the Mission's wording actually make
+existing goals stale? every time, or only for certain kinds of edits?
+does the user want to be told, or does that become noise every time
+they refine their Mission statement?). That last question is a product
+decision, not a data-modeling one, and worth answering before adding
+the column — this insight feature has zero test coverage anywhere in
+the suite prior to this entry, meaning nobody has verified this
+feature's UX at all yet, on top of it never having worked correctly
+since a mission was ever superseded.
+
+**Testing:** one new test
+(`tests/test_m7_insight.py::test_misaligned_goals_check_stays_a_noop_after_a_mission_supersession`)
+confirmed to FAIL against the old `mission.id` comparison and PASS
+against the `identity_id` no-op — protects the "always empty, on
+purpose" state itself, so a future revert to `mission.id` fails loudly
+instead of silently reintroducing the false-positive-on-every-
+supersession bug. 355 tests pass against a live Postgres (up from 354).
+
+**Needs architect decision:** yes, deferred on purpose per the above —
+whether/how to rebuild this (new schema field + the product question
+of what "misaligned" should mean) is left for the architecture
+revision being considered, not decided here.
+
+## [2026-08-27] Answering "why does building one feature break another": it doesn't, but fixing one bug can turn on a second, older one
+
+**The question this entry directly answers:** after the mission.identity_id
+fix, `_asserts_wrong_status` (reasoning/api.py's status-conflation
+guard, unrelated to V1-M2, present since 2026-08-14) started rejecting
+grounded replies to plain "list my goals" / "what should we do today"
+questions almost every time, forcing the safe-but-repetitive raw-
+evidence fallback. This looked like the identity_id fix had introduced
+a regression. It hadn't — it exposed one.
+
+**Mechanism, verified with real code, not inferred from the log:**
+called `_asserts_wrong_status` directly with the user's real goal list
+(2 Active, 2 Cancelled, 1 Draft) and a fully accurate sentence a
+reasonable assistant would write to summarize it: "Your active goals
+are exam overloaded and Build Jarvis, while Make a game, Test, and Run
+an ironman run are not currently active." The guard returned True —
+flagged as a violation — on a sentence containing no false claim at
+all. Root cause: the guard's sentence-level check (added 2026-08-23c
+for a different false-positive) tests whether "active" and a non-
+active goal's title share a sentence, but never checks whether that
+occurrence of "active" is negated. "X and Y are active, while Z is
+NOT active" is exactly how anyone — human or model — naturally
+summarizes several goals of mixed status in one sentence, and it was
+exactly the shape this guard rejected.
+
+**Why this never fired before today:** `gather_grounded_evidence`
+returned an empty goal list from the moment it was written until this
+session's earlier fix (see this file's mission.identity_id entry) —
+there was never a real non-active title for this guard's blind spot to
+trigger on. The guard, the blind spot, and the bug that hid it are all
+older than V1-M2 and unrelated to it; M2's mission-change feature is
+just what got a mission superseded for the first time, which is what
+surfaced the identity_id bug, which is what finally gave this guard
+real data complex enough to expose its own separate, pre-existing flaw.
+Three independent, real components; one exposed the next, in sequence,
+none of them new.
+
+**Fix:** `_asserts_wrong_status` now skips a sentence where "active" is
+preceded by a negation cue (not/n't/no longer/isn't/aren't/wasn't/
+weren't/never) within a few words — same cost trade-off this guard has
+used at every prior revision (a missed detection just costs an
+unnecessary fallback; a false rejection was making every accurate
+multi-status summary indistinguishable from a wrong one, constantly,
+the moment real data existed).
+
+**Known, accepted limitation, same trade-off as always:** a sentence
+containing BOTH a genuine violation AND an unrelated negation
+elsewhere ("Make a game is not active, but Test is active too" — Test
+is really Cancelled) will be missed. Verified this directly: the fix
+does let this specific adversarial case through uncaught. Consistent
+with every prior revision of this guard, which has always accepted
+this exact shape of risk in exchange for eliminating a false-positive
+that was firing on real, ordinary traffic — a rare missed detection
+degrades to the same "not sure I'm not overstating, here's the raw
+evidence" the fallback always gives, so it's not a case of the guard's
+absence letting through anything the fallback couldn't have safely
+degraded to.
+
+**Testing:** verified deterministically, not by asserting on prompt
+wording (unlike most of this file's other entries — this guard is
+pure Python, not an LLM instruction, so its behavior IS fully
+testable). Reverted the fix and confirmed 2 new tests failed; restored
+it and confirmed all pass, same discipline as the mission.identity_id
+fix. Added: an accurate negated same-sentence claim (was the false
+positive), an "isn't active" phrasing variant, and a check that the
+original 2026-08-14 true positive still fires with the negation logic
+in place. 358 tests pass against a live Postgres (up from 355).
+
+**Needs architect decision:** no — this is a self-contained, fully
+deterministic bug fix with no ambiguity in what correct behavior
+means, unlike the insight/api.py entry above.
+
+## [2026-08-27] Observability gap: guard rejections never logged what was rejected
+
+**Prompted by:** a live rejection (`_asserts_wrong_status`, right after
+a Gemini 429 forced a fallback to Groq's `openai/gpt-oss-120b`) that
+was impossible to diagnose after the fact — the log said a guard
+fired, never what it rejected. Given the negation fix earlier this
+same day, and a newly-noticed second risk (one of the user's Cancelled
+goals is literally titled "Test" — a common English word the
+substring-matching guards can collide with in an unrelated sentence),
+there was no way to tell a genuine catch from a new false-positive
+shape without reconstructing the live scenario from scratch, same as
+every other entry today started out.
+
+**Fix:** every guard-rejection `log.warning(...)` call in both
+`_conversational_reply` and `_grounded_reply` (6 total — garbled
+output, unsupported-relationship, wrong-mission, wrong-status,
+reasoning-leak, capability-claim, fabricated-UI) now includes the
+actual rejected `reply` text (`{reply!r}`), not just which guard fired.
+2026-08-23c already established that "which guard fired" needed its
+own log line instead of one collapsed message; this is the same
+reasoning taken one step further — the guard name alone still wasn't
+enough, twice now, to tell a correct rejection from an incorrect one
+without live reconstruction.
+
+**Not a behavior change** — no guard logic changed, nothing about when
+a rejection happens or what replaces it. Purely additive to the log
+line's content. 358 tests pass (unchanged from the prior entry; no
+test asserts on exact log text).
+
+**Still open, deliberately not chased further:** whether the specific
+rejection that prompted this was a genuine catch or a new false
+positive (possibly the "Test"-is-a-common-word collision above) was
+never determined — the reply text wasn't available for that specific
+incident, only for future ones. Worth watching for a recurrence now
+that it'll actually be diagnosable from the log alone.
+
+**Needs architect decision:** no.
+
+## [2026-08-28] "What can you tell about me?" rejected mid-answer — same class of bug, worse blast radius
+
+**Symptom:** a correct, accurate answer to "what can you tell about
+me?" — recalling durable memory content exactly the way this system's
+own 2026-08-17 fix says it should — was rejected by
+`_claims_unbacked_action` (the capability-claim guard) and replaced
+with the generic "I want to be careful not to overstate..." fallback.
+The very next turn, phrased slightly differently ("I know you are
+working toward...") for the same underlying content, sailed through
+untouched.
+
+**Root cause, reproduced directly against the real guard function, not
+inferred from the log:** the guard runs two independent regex checks
+over the WHOLE reply text — does an "I have/I've/I'll" phrase appear
+anywhere, and does a persistence verb (save, stored, noted, tracked,
+etc.) appear anywhere — with no requirement that the two are even
+grammatically related, let alone that the verb narrates a NEW action
+rather than naming EXISTING content. "based on what I have stored" is
+a relative clause ("the things I have stored") — not a narrated action
+("I have stored X for you") — but the crude co-occurrence check can't
+tell the difference. Worse blast radius than the `_asserts_wrong_status`
+negation bug from earlier the same day: that one at least operated per-
+sentence; this one runs over the entire reply with zero scoping at
+all.
+
+**Fix:** added `_RECALLS_EXISTING_MEMORY`, a targeted exemption for the
+"what I('ve| have) ... V" construction specifically, rather than a
+general loosening of the guard. Verified directly: the exact live
+false-positive and a same-shape variant with a different verb both now
+pass; its lucky sibling ("I know you are...") is unaffected (still
+passed, was never the problem); three genuine violations (including
+the original 2026-08-14 reported bug) still correctly flagged.
+
+**Known, accepted limitation, same trade-off as every guard revision
+in this file:** a reply containing BOTH a legitimate recall phrase and
+a separate, genuine false claim elsewhere would now slip through
+whole. Accepted because a missed detection here costs a real, correct
+answer being shown instead of the fallback — not nothing, but strictly
+better than the alternative this bug was actually causing: a real,
+desired feature (answering "what do you know about me" from memory,
+explicitly committed to since 2026-08-17) being defeated by its own
+safety guard on a large fraction of otherwise-correct replies, for no
+gain, since the fallback isn't safer than a correct recall — it's just
+less useful.
+
+**Testing:** extended the existing parametrized
+`test_claims_unbacked_action_detector` (9 new cases: the exact live
+false positive, a same-shape variant, its always-passing sibling, and
+two confirmed-still-caught genuine violations) rather than adding a
+separate test function, matching this test's own established shape.
+Reverted the fix and confirmed 2 cases failed; restored it and
+confirmed all 12 pass, same discipline as every deterministic fix
+today. 363 tests pass against a live Postgres (up from 358).
+
+**Needs architect decision:** no.
+
+## [2026-08-28b] Mission statement was never in evidence at all — same failure shape as the 2026-08-10 title fix, one field over
+
+**Symptom:** "what's the statement?" answered with the mission's TITLE,
+verbatim, as if it were the statement.
+
+**Root cause, confirmed by printing the real evidence string for this
+exact scenario before touching any code:** `reasoning/api.py`'s
+`_build_structured_evidence` serializes the Mission into evidence as
+`{"title": mission.title}` — `mission.statement` was never included
+there at all, for any reasoning-routed question, since this function
+was written. This is the exact same failure shape as this file's own
+2026-08-10 entry a few lines above in the same function ("the Mission's
+actual title was never included here... the LLM had no real Mission
+data to draw from and confidently relabeled [something else] instead")
+— that fix added the title; it just never occurred to also add the
+statement sitting right next to it on the same object.
+
+**Fix:** one field added to the evidence dict,
+`{"title": mission.title, "statement": mission.statement}`, plus an
+explicit note in the evidence's own `mission_note` field telling the
+model these are two distinct fields, never to be conflated — matching
+this function's existing pattern of writing corrective notes directly
+into the evidence rather than only into a system prompt.
+
+**Verification, same discipline as every fix today:** printed the real
+evidence for a mission with a title deliberately different from its
+statement, confirmed the statement was missing before the fix and
+present after. Added a regression test, confirmed it fails against the
+reverted code and passes against the restored fix. 364 tests pass
+against a live Postgres (up from 363).
+
+**Needs architect decision:** no.
+
+## [2026-08-28c] The mission-statement fix immediately exposed a third guard with the same whole-text blind spot
+
+**Symptom:** "what can i do with the cancelled goals?" got a genuinely
+good, accurate, multi-paragraph answer — correctly quoting the real
+Mission statement, correctly naming the two Cancelled goals — rejected
+anyway: "Grounded reply rejected — conflated a Goal with the Mission."
+
+**Root cause, reproduced directly against the guard before touching
+anything:** `_asserts_wrong_mission` (2026-08-10) checked whether
+"mission" appears ANYWHERE in the whole reply and a Goal title appears
+ANYWHERE in the whole reply, with no requirement they're related — the
+exact same shape of blind spot already fixed once today in
+`_asserts_wrong_status`. It went unnoticed until now for the same
+reason as that fix and yesterday's identity_id bug: before today's
+mission.statement fix, the ONLY way for the model to "correctly"
+reference the Mission was to repeat its title verbatim, so a reply that
+discussed the Mission AND named goals in the same breath was rare and
+usually was a real conflation. The instant the model could accurately
+discuss the Mission through its actual statement instead, ordinary,
+correct replies — "if the goals don't serve your mission ('improve
+your health, relationships...'), Make a game might still be worth
+keeping" — started tripping this guard on totally legitimate text,
+because "mission" and "Make a game" both appeared somewhere in a long
+answer that never happened to repeat the literal title.
+
+**Fix:** restricted to the same per-sentence scoping
+`_asserts_wrong_status` already established earlier the same day — only
+a genuine same-sentence co-occurrence of "mission" and a goal title
+still counts. Verified directly: the live false-positive reply now
+passes; the original 2026-08-10 true positive ("Your active mission is
+to Build jarvis v1.") still fails.
+
+**Pattern worth naming explicitly, now that it's happened three times
+in two days:** every one of these guards was written and correctly
+tested against the evidence gap that existed at the time. Each time a
+real evidence gap got fixed (empty goals after supersession, no
+statement in evidence), a guard built around the OLD, more limited
+evidence started misfiring on exactly the richer, more correct answers
+the fix made possible. This isn't a reason to stop fixing evidence
+gaps — it's a reason to specifically re-test EVERY existing guard
+against realistic multi-topic replies whenever evidence gets richer,
+rather than assume a guard that passed its own original test suite is
+still scoped correctly once the inputs around it change.
+
+**Testing:** two new tests extending the existing
+`test_guard_*_mission` block (matching its own established style,
+not a separate test function) — the live false positive, and a
+conflation-among-unrelated-sentences case confirming detection wasn't
+lost. Reverted to a whole-text check and confirmed the first test
+failed; restored and confirmed both pass. 366 tests pass against a
+live Postgres (up from 364).
+
+**Known, accepted limitation, same trade-off as always:** a sentence
+that legitimately combines a real goal title with "mission" without
+conflating them ("Make a game doesn't align with your mission") would
+still be flagged. Not yet observed in practice, not chased pre-
+emptively — costs the same safe fallback, not a wrong answer reaching
+the user.
+
+**Needs architect decision:** no — but recommend treating "re-run every
+guard against a multi-topic reply" as a standing checklist item
+whenever evidence gains a new field, given this is now a demonstrated,
+repeating failure mode rather than a one-off.
+
+## [2026-08-29] Third false positive in the same guard: hypothetical/offered future status, not negated, not a whole-text co-occurrence
+
+**Symptom:** "what can i do with the cancelled goal?" got a correct,
+helpful answer ("we can update their status back to Active or Draft")
+rejected by `_asserts_wrong_status`. Verified this wasn't the
+2026-08-27 negation bug recurring, nor a deployment issue, by
+reproducing it directly against the current (already-fixed) guard code
+before writing anything.
+
+**Root cause:** a new, third blind spot in the same guard — "we **can**
+update their status back to Active" is a hypothetical offer of a
+future change, not a claim about the goal's current status. No
+negation word is present, so the 2026-08-27 fix (which only strips
+negated occurrences of "active") doesn't touch this at all. This isn't
+a rare phrasing accident: it's close to the *only* natural way to
+answer "what can I do with a cancelled goal" or "can I make it active
+again" — exactly the kind of question V1-M2's status-change feature
+invites people to ask about the goals it lets them change.
+
+**Fix:** added `_HYPOTHETICAL_ACTIVE`, exempting a sentence where a
+modal/conditional verb (can/could/would/may/might/will/should) precedes
+"active" within a short window — same per-sentence scoping the
+2026-08-27 fix already established, applied to a second exemption
+pattern rather than widening the first one.
+
+**Known, accepted limitation — tested and disclosed, not discovered
+later:** deliberately tried to break this before calling it done: "You
+can see that Build jarvis is active" is a genuine false claim (Build
+jarvis is Draft) that also happens to contain "can" near "active", and
+it slips through uncaught. The modal there governs "see", not a change
+of state, and this check has no way to tell the difference. Not
+observed in real dogfooding traffic — same "don't chase a
+hypothetical failure pre-emptively" call already made for the mission
+guard's own analogous gap earlier this week.
+
+**Testing:** three new tests — the exact live phrasing, a second
+hypothetical variant with different wording, and a check that the
+original 2026-08-14 true positive still fires. Reverted the fix and
+confirmed both hypothetical-phrasing tests failed (the true-positive
+test correctly still passed, since that path was untouched); restored
+and confirmed all three pass. 369 tests pass against a live Postgres
+(up from 366).
+
+**On why this keeps happening, since it's now three fixes to one guard
+in three days:** each was a genuinely different, non-overlapping blind
+spot (whole-text scoping, negation, modal/hypothetical phrasing) in the
+same underlying approach — matching words near other words with no
+real grammatical understanding. That approach is inherently going to
+keep having edges like this; it's not that these fixes were wrong, it's
+that pattern-matching English this way has a long tail of shapes that
+only show up under real, varied traffic. Worth factoring into whatever
+the architecture revision decides about this whole guard layer —
+this isn't a call to make here, just data for that decision.
+
+**Needs architect decision:** no for this specific fix — but the
+pattern-of-three above is worth weighing when the guard layer itself
+gets reconsidered.
+
+## [2026-08-29b] The most consequential version of the same evidence-gap pattern: the conversational path could tell you something false, and the policy layer would then correctly contradict it
+
+**Symptom, and why it's worse than any prior entry this week:** "what
+can I do with a cancelled goal?" (an ordinary, reasoning-routed
+informational question) was answered "we can change its status back to
+Active or Draft." Two turns later, actually trying it ("reactivate it
+to draft") was correctly REJECTED: "terminal rules don't allow changing
+a cancelled goal back to draft." From the person's side, that's Jarvis
+flatly contradicting itself — told them something was possible, then
+refused to do the exact thing it just said was possible. Every prior
+guard-rejection entry this week was "a correct answer got thrown away
+for a safe fallback" — annoying, never wrong. This one is different in
+kind: the conversational answer was actively FALSE, stated with full
+confidence, and acted as if authoritative.
+
+**Root cause:** `goals.api.ALLOWED_TRANSITIONS[CANCELLED] == set()` —
+Cancelled is terminal, zero valid next statuses, and this has been true
+the whole time. `state_change/policy.py` has always read this table
+correctly (that's why the rejection was right). But
+`gather_grounded_evidence` — the informational/conversational path's
+only source of truth about goals — never included transition
+information for a goal AT ALL. Asked what's possible for a goal, the
+model had nothing authoritative to draw from and invented a plausible-
+sounding, completely wrong answer. Two independent code paths were
+answering the same underlying question — "what can this goal become"
+— from two different information sources, and only one of them was
+ever connected to the actual rule.
+
+**Fix:** every goal's evidence now includes `possible_next_statuses`,
+computed directly from `goals.api.ALLOWED_TRANSITIONS` — the exact
+table the policy layer already enforces, not a second copy of it that
+could drift out of sync. An empty list is explicitly documented in the
+evidence's own `status_note` as meaning terminal — no further change
+possible, regardless of how the question is phrased. One source of
+truth for both paths now, matching the discipline this project has
+used for entity resolution and everything else that touches real state.
+
+**Verification:** printed the real evidence for both a Cancelled goal
+(confirmed `possible_next_statuses: []`) and a fresh Draft goal
+(confirmed `['Active', 'Archived', 'Cancelled']`, the real allowed set)
+against live Postgres before writing a single test. Two new regression
+tests, reverted and confirmed both fail without the fix, restored and
+confirmed both pass. 371 tests pass against a live Postgres (up from
+369).
+
+**Why this one matters more than the guard fixes this week:** those
+were the safety net catching something and falling back — never wrong,
+just occasionally less polished than it could be. This bug means the
+safety net had nothing to catch, because the false information was
+never flagged as false by anything — it read as a perfectly reasonable,
+confidently-stated answer, and only contradicted itself once someone
+tried to act on it. Worth treating "does the conversational path have
+authoritative data, or is it inferring from vibes" as a standing
+question for any future evidence field, not just transitions — the
+mission-statement bug three days ago and this one are the same shape:
+a real fact existed in the system, the reasoning path just never had
+access to it.
+
+**Needs architect decision:** no.
+
+## [2026-08-29c] Defense-in-depth for the plain conversational path's total lack of goal-status evidence
+
+**Contract/section:** follow-up to this same file's 2026-08-29b entry
+(the ALLOWED_TRANSITIONS-in-evidence fix).
+
+**Symptom:** "what can i do with archive goals?" stayed in the plain
+conversational path (no `task_type=hard` call — routing decided
+`needs_reasoning=False`) and answered "I do not have the ability to
+modify or move goals right now." The CONCLUSION happened to be correct
+(Archived is terminal, same as Cancelled), but the stated REASON is
+false and contradicts something the same conversation had just
+demonstrated two turns earlier — this system successfully archived a
+goal via natural language in that same session.
+
+**Root cause, confirmed by reading the code, not inferring from the
+transcript:** `_conversational_reply`'s prompt is built entirely from
+`mission.title`, `_capability_grounding()`, `_REAL_INTERFACE`,
+`known_memories`, and recent conversation — it never calls
+`gather_grounded_evidence` and has zero access to any goal's real
+status or transition data, ever, by design (that's the whole
+distinction between this path and the reasoning path). The 2026-08-29b
+fix only helps when routing correctly classifies a question as needing
+reasoning; when it doesn't, the model is back to guessing, and this
+time it guessed a FALSE, generic capability denial instead of a
+correct, evidence-based one.
+
+**Fix, deliberately two layers rather than betting on one:**
+1. `_ROUTING_SYSTEM`'s needs_reasoning TRUE examples extended with the
+   exact observed phrasing ("what can I do with my cancelled goals",
+   "can I make an archived goal active again") — the earlier
+   2026-08-27 fix covered "what statuses can I move X to" but not this
+   more casual "what can I do with X" phrasing, which is at least as
+   natural a way to ask the same thing.
+2. `_CONVERSATIONAL_SYSTEM` now explicitly forbids the exact failure
+   observed: asked whether a goal's status could change, without real
+   transition data in hand, say plainly you're not certain of that
+   specific rule — never a blanket "I don't have the ability to modify
+   goals," which is categorically false for this system.
+
+**Why two layers instead of either alone:** layer 1 reduces how often
+this question ever reaches the ungrounded path at all; layer 2 makes
+the ungrounded path honest on the (inevitable, given routing is an LLM
+classification and not perfectly reliable — demonstrated repeatedly
+this week) cases where it still does. Chose this over giving
+`_conversational_reply` its own copy of goal evidence, which would
+blur the deliberate architectural separation between the two reply
+paths that this whole system is built around — a bigger, more
+structural change than this specific bug warrants.
+
+**Honest limitation, same as every prompt-only fix in this file:**
+both changes are verified as prompt CONTENT only (both new tests check
+the actual system-prompt strings), not verified model compliance —
+that needs real traffic to confirm, same caveat as the 2026-08-17 and
+2026-08-27 routing fixes before it.
+
+**Testing:** two new tests. 373 tests pass against a live Postgres (up
+from 371).
+
+**Needs architect decision:** no for this specific fix — but if real
+traffic keeps finding cases the routing-prompt approach doesn't catch,
+the "give the conversational path a narrow, targeted slice of
+evidence" alternative floated and set aside here is worth revisiting
+as a deliberate design decision, not a patch.

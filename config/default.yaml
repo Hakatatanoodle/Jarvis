@@ -38,22 +38,48 @@ llm:
     openrouter:
       api_key_env: OPENROUTER_API_KEY
       base_url: https://openrouter.ai/api/v1/chat/completions
+    zai:
+      api_key_env: ZAI_API_KEY
+      base_url: https://api.z.ai/api/paas/v4/chat/completions
+    codecraft:
+      api_key_env: CODECRAFT_API_KEY
+      base_url: https://codecraftapi.com/v1/chat/completions
+    github:
+      api_key_env: GITHUB_TOKEN
+      base_url: https://models.github.ai/inference/chat/completions
 
   # Ordered fallback chains per task category. Each candidate declares
   # the capabilities it satisfies so the router never picks a fallback
   # that can't meet a request's requirements (e.g. vision).
+  #
+  # Reworked 2026-09-08 for free-tier resilience (see
+  # V1_M5_IMPLEMENTATION_RECORD.md's 2026-09-08 entry): Gemini was
+  # account-denied and Groq's 8K TPM cap was getting blown almost every
+  # turn, so each chain now leads with a genuinely-free-at-volume
+  # candidate (z.ai glm-4.7-flash / GitHub Models) instead of the two
+  # exhausted providers. Gemini/Groq are kept further down the chain in
+  # case the account issue or TPM limit ever gets resolved, not removed.
+  # Rebuilt 2026-09-08: GitHub Models was fully retired 2026-07-30 (not a
+  # transient outage — confirmed via GitHub's own changelog/support docs).
+  # Recommending it as a second-tier candidate across all three routes was
+  # a mistake on my (the assistant's) part — should have verified it was
+  # still live before wiring it in. Pulled from every route below;
+  # GitHubModelsProvider is left in infra/llm_router.py unused rather than
+  # deleted, in case a similar free catalog reappears under the same
+  # OpenAI-compatible shape later.
   routes:
     chat:
-      - {provider: gemini, model: gemini-3.5-flash-lite, capabilities: [text, json]}
+      - {provider: zai, model: glm-4.7-flash, capabilities: [text, json]}
       - {provider: groq, model: openai/gpt-oss-20b, capabilities: [text, json, tool_calling]}
+      - {provider: gemini, model: gemini-3.5-flash-lite, capabilities: [text, json]}
     hard:
-      - {provider: gemini, model: gemini-3.6-flash, capabilities: [text, json, tool_calling, long_context, vision]}
+      - {provider: codecraft, model: deepseek-v4-flash-0731, capabilities: [text, json, tool_calling, long_context, reasoning]}
       - {provider: groq, model: openai/gpt-oss-120b, capabilities: [text, json, tool_calling, reasoning]}
-      - {provider: groq, model: qwen/qwen3.6-27b, capabilities: [text, json, vision, reasoning]}
+      - {provider: gemini, model: gemini-3.6-flash, capabilities: [text, json, tool_calling, long_context, vision]}
     coding:
+      - {provider: codecraft, model: deepseek-v4-flash-0731, capabilities: [text, json, tool_calling, long_context, reasoning]}
       - {provider: openrouter, model: "qwen/qwen3-coder:free", capabilities: [text, json, tool_calling, long_context]}
       - {provider: gemini, model: gemini-3.6-flash, capabilities: [text, json, tool_calling, long_context, vision]}
-      - {provider: groq, model: openai/gpt-oss-120b, capabilities: [text, json, tool_calling, reasoning]}
 
   # Final emergency pool once every route candidate above has failed.
   # openrouter/free is OpenRouter's own auto-router alias (not a pinned
@@ -68,10 +94,73 @@ context:
   # (CE-10); this is only the ceiling it operates under.
   default_budget_tokens: 8000
 
+user:
+  # Dogfooding fix, 2026-09-08 (see V1_M5_IMPLEMENTATION_RECORD.md's
+  # entry that day): IANA timezone name. Jarvis is a single-user
+  # personal assistant, not a multi-tenant service, so this is static
+  # config here rather than a UserModel row — contracts/user_model.py's
+  # own docstring says that projection isn't populated until M8 anyway.
+  # Used by capability_invocation/extraction.py to resolve a bare time
+  # the user states ("12 pm") into the correct UTC-offset instant;
+  # without it, every such time was silently anchored to UTC instead of
+  # the user's actual local time.
+  timezone: "Asia/Kathmandu"
+
 permission:
   # V0 ships binary allow/deny/confirm only. Permission Profiles
   # (Conservative/Balanced/Autonomous, PS-06) are §5.2 scope, not M0.
   default_mode: confirmation_required
+
+filesystem:
+  # V1-M6: allow-listed roots for real filesystem navigation (fs.read/
+  # fs.write). Config-driven per the roam-scope decision in
+  # M6_HANDOVER_PROMPT.md — NOT the whole filesystem, NOT the whole home
+  # directory. Paths may use ~ for the user's home. A resolved path that
+  # is not a descendant of one of these is refused, never clamped.
+  allowed_roots:
+    - "~/Projects"
+  # Glob patterns checked against every path segment of a resolved path
+  # (not just the final filename) — applies even inside an allowed root.
+  # See capabilities/primitives/_fs_safety.py.
+  blocked_patterns:
+    - ".ssh"
+    - ".aws"
+    - ".gnupg"
+    - ".netrc"
+    - ".env"
+    - ".env.*"
+    - "*.pem"
+    - "*.key"
+    - "id_rsa*"
+    - "id_ed25519*"
+    - ".git/config"
+    - "Application Support/Google/Chrome"
+    - "Library/Keychains"
+    - "*.kdbx"
+
+calendar:
+  # M5: real Google Calendar via MCP (infra/mcp_client.py,
+  # capabilities/primitives/calendar_ops.py), replacing the old
+  # local-Postgres-table calendar.* capabilities. Only the connection
+  # endpoint and the account nicknames live here — no credential or
+  # token ever goes in this file (§8, INF-27/28/29's own "no
+  # code-embedded config" rule; see data/google_calendar/.gitkeep and
+  # .gitignore). server_url matches the calendar-mcp service's
+  # 127.0.0.1-bound port in docker-compose.yml.
+  mcp:
+    server_url: http://127.0.0.1:3000/mcp
+    request_timeout_seconds: 15
+  # Nicknames must exactly match the account names the calendar-mcp
+  # server itself was authenticated under (see data/google_calendar/'s
+  # own setup instructions / docs/authentication.md) — Jarvis never
+  # invents or renames these, it only ever passes one straight through
+  # as the MCP `account` tool parameter. First entry is used when a
+  # natural-language request doesn't specify an account and the
+  # capability call itself doesn't omit-to-auto-select (see
+  # capability_invocation/extraction.py's account_ref handling).
+  accounts:
+    - work
+    - personal
 
 insight:
   # Weekly only in V0 (§5.1). See contracts.enums.InsightScope.

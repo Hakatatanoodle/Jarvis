@@ -130,7 +130,15 @@ def classify_error(exc: Exception) -> str:
         status = exc.response.status_code
         if status == 429 or status in (408, 500, 502, 503, 504):
             return ErrorCategory.RETRYABLE
-        if status in (401, 403):
+        if status in (401, 402, 403):
+            # 402 added 2026-09-08: CodeCraft API (and any other
+            # balance-metered provider) returns 402 insufficient_funds
+            # once a monthly free-tier token allowance is exhausted —
+            # that won't resolve by retrying within the session, same
+            # "not provider's fault, but not coming back soon either"
+            # shape as an auth failure, so it gets the same treatment
+            # (skip to next candidate, longer cooldown) rather than the
+            # short exponential-backoff UNKNOWN would otherwise give it.
             return ErrorCategory.AUTH
         if status in (400, 404, 422):
             return ErrorCategory.BAD_REQUEST
@@ -194,12 +202,6 @@ class GroqProvider(LLMProvider):
         data = await _request(max_tokens)
         choice = data["choices"][0]
         content = choice["message"]["content"]
-        if not content:
-            # Fix (§6.5, 2026-08-11): a soft failure — HTTP 200 but
-            # null/empty content — must not propagate as a real string;
-            # treat it as a provider failure so the retry/fallback
-            # chain gets a chance to recover.
-            raise LLMUnavailableError(f"groq/{model} returned empty/null content")
 
         # Fix (2026-08-24): live dogfooding of the grounded-conversation
         # path (see ARCHITECTURE_ISSUES.md) showed genuine multi-step
@@ -212,11 +214,35 @@ class GroqProvider(LLMProvider):
         # the standard OpenAI-compatible signal for exactly this — Groq
         # uses that shape. One bounded retry at a larger budget, capped
         # so a persistently verbose model can't runaway the request.
+        #
+        # Fix (2026-08-31, ported from the parallel V1-M5 session ahead
+        # of merge — see V1_M6_IMPLEMENTATION_RECORD.md): this retry
+        # must run BEFORE the empty-content check below, not after —
+        # reasoning models (gpt-oss-20b/120b) can spend the entire
+        # max_tokens budget on hidden reasoning and leave `content`
+        # completely empty with finish_reason=="length". That's the
+        # exact same truncation this block exists to retry, just at the
+        # extreme (0 output tokens instead of a partial one). With the
+        # empty-content check running first, this retry was unreachable
+        # for precisely the case it was built for — confirmed against
+        # Groq's own docs: gpt-oss-20b/120b default to
+        # reasoning_effort="medium" and route reasoning tokens through a
+        # separate `reasoning` field, consuming from the same max_tokens
+        # budget as `content`.
         if choice.get("finish_reason") == "length" and _truncation_retry_allowed(max_tokens):
             retried = await _request(_next_truncation_retry_budget(max_tokens))
             retried_content = retried["choices"][0]["message"]["content"]
             if retried_content:
                 content = retried_content
+
+        if not content:
+            # Fix (§6.5, 2026-08-11): a soft failure — HTTP 200 but
+            # null/empty content — must not propagate as a real string;
+            # treat it as a provider failure so the retry/fallback
+            # chain gets a chance to recover. (Reached only after the
+            # truncation retry above has already had its shot — see the
+            # 2026-08-31 note above for why the order matters.)
+            raise LLMUnavailableError(f"groq/{model} returned empty/null content")
         return content
 
 
@@ -351,12 +377,144 @@ class OpenRouterProvider(LLMProvider):
         return content
 
 
+class ZaiProvider(LLMProvider):
+    """z.ai (GLM models), added 2026-09-08 for the free-tier-resilience
+    push — see V1_M5_IMPLEMENTATION_RECORD.md's 2026-09-08 entry.
+    Standard OpenAI-compatible chat/completions (verified against
+    docs.z.ai 2026-09-08); GLM-5.2/5.3 are metered even on a direct z.ai
+    key — only the *-flash tier (glm-4.5/4.6v/4.7-flash) is genuinely
+    free, which is what config/default.yaml actually points this at."""
+    name = "zai"
+
+    async def call(self, model: str, system: str, prompt: str, max_tokens: int) -> str:
+        key = os.environ.get("ZAI_API_KEY")
+        if not key:
+            raise ProviderNotConfiguredError("ZAI_API_KEY not set")
+
+        async def _request(tokens: int) -> dict:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.post(
+                    "https://api.z.ai/api/paas/v4/chat/completions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": model,
+                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        "max_tokens": tokens,
+                    },
+                )
+                _with_body_on_error(resp)
+                return resp.json()
+
+        data = await _request(max_tokens)
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+        # Same truncation-retry as GroqProvider — standard OpenAI-shape
+        # finish_reason field, and GLM is a reasoning-capable family too
+        # (can spend budget on hidden reasoning the same way gpt-oss does).
+        if choice.get("finish_reason") == "length" and _truncation_retry_allowed(max_tokens):
+            retried = await _request(_next_truncation_retry_budget(max_tokens))
+            retried_content = retried["choices"][0]["message"]["content"]
+            if retried_content:
+                content = retried_content
+        if not content:
+            raise LLMUnavailableError(f"zai/{model} returned empty/null content")
+        return content
+
+
+class CodeCraftProvider(LLMProvider):
+    """CodeCraft API (multi-model reseller), added 2026-09-08 — see
+    V1_M5_IMPLEMENTATION_RECORD.md's 2026-09-08 entry. Standard OpenAI-
+    compatible chat/completions, verified against codecraftapi.com/docs
+    2026-09-08. Free plan is a 1M-token/month allowance, not unlimited —
+    once exhausted the API returns 402 insufficient_funds, which
+    classify_error() now maps to ErrorCategory.AUTH (see that change's
+    2026-09-08 comment) so the router skips this candidate for a real
+    cooldown period instead of retrying a quota that won't refill until
+    next month."""
+    name = "codecraft"
+
+    async def call(self, model: str, system: str, prompt: str, max_tokens: int) -> str:
+        key = os.environ.get("CODECRAFT_API_KEY")
+        if not key:
+            raise ProviderNotConfiguredError("CODECRAFT_API_KEY not set")
+
+        async def _request(tokens: int) -> dict:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.post(
+                    "https://codecraftapi.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": model,
+                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        "max_tokens": tokens,
+                    },
+                )
+                _with_body_on_error(resp)
+                return resp.json()
+
+        data = await _request(max_tokens)
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+        if choice.get("finish_reason") == "length" and _truncation_retry_allowed(max_tokens):
+            retried = await _request(_next_truncation_retry_budget(max_tokens))
+            retried_content = retried["choices"][0]["message"]["content"]
+            if retried_content:
+                content = retried_content
+        if not content:
+            raise LLMUnavailableError(f"codecraft/{model} returned empty/null content")
+        return content
+
+
+class GitHubModelsProvider(LLMProvider):
+    """GitHub Models (models.github.ai — the free "market" catalog, not
+    the separate api.githubcopilot.com Copilot-only catalog), added
+    2026-09-08 — see V1_M5_IMPLEMENTATION_RECORD.md's 2026-09-08 entry.
+    Standard OpenAI-compatible chat/completions; auth is any GitHub
+    personal access token with the `models` scope, not a
+    service-specific key."""
+    name = "github"
+
+    async def call(self, model: str, system: str, prompt: str, max_tokens: int) -> str:
+        key = os.environ.get("GITHUB_TOKEN")
+        if not key:
+            raise ProviderNotConfiguredError("GITHUB_TOKEN not set")
+
+        async def _request(tokens: int) -> dict:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.post(
+                    "https://models.github.ai/inference/chat/completions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": model,
+                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        "max_tokens": tokens,
+                    },
+                )
+                _with_body_on_error(resp)
+                return resp.json()
+
+        data = await _request(max_tokens)
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+        if choice.get("finish_reason") == "length" and _truncation_retry_allowed(max_tokens):
+            retried = await _request(_next_truncation_retry_budget(max_tokens))
+            retried_content = retried["choices"][0]["message"]["content"]
+            if retried_content:
+                content = retried_content
+        if not content:
+            raise LLMUnavailableError(f"github/{model} returned empty/null content")
+        return content
+
+
 def _provider_registry() -> dict[str, LLMProvider]:
     # Built fresh per call, not at module load — resolves the current
     # module-global classes, so test mocks (patch.object(GroqProvider,
     # "call", ...)) actually take effect rather than freezing references
     # to the original bound methods at import time.
-    return {"groq": GroqProvider(), "gemini": GeminiProvider(), "openrouter": OpenRouterProvider()}
+    return {
+        "groq": GroqProvider(), "gemini": GeminiProvider(), "openrouter": OpenRouterProvider(),
+        "zai": ZaiProvider(), "codecraft": CodeCraftProvider(), "github": GitHubModelsProvider(),
+    }
 
 
 # --------------------------------------------------------------------------

@@ -57,6 +57,14 @@ from typing import Literal, Optional
 from uuid import uuid4
 
 from capabilities.registry import list_capabilities
+from capability_invocation.dispatch import (
+    PendingCapabilityConfirmation,
+    resolve_and_dispatch as resolve_capability_invocation,
+    resolve_pending_capability_invocation,
+)
+from capability_invocation.extraction import extract_candidate as extract_capability_invocation
+from capability_invocation.dispatch import get_current_directory as get_fs_current_directory
+from config.loader import load_config
 from contracts.conversation_turn import ConversationTurn
 from contracts.decision import Decision
 from contracts.enums import ContextSourceType, MemoryStatus
@@ -121,7 +129,9 @@ _ROUTING_SYSTEM = (
     "history. Examples that need reasoning (true): 'what should I work "
     "on today', 'how am I doing on my goals', 'prioritize my tasks', "
     "'what's the status of my Test goal', 'what statuses can I move my "
-    "Test goal to' — these ask about a specific, real goal, not about "
+    "Test goal to', 'what can I do with my cancelled goals', 'can I "
+    "make an archived goal active again' — these ask about a specific, "
+    "real goal or status, not about "
     "Jarvis in the abstract, even though 'what are the statuses I can "
     "set X to' superficially resembles a generic capability question. "
     "Examples that do NOT need reasoning (false), even though they're "
@@ -150,7 +160,13 @@ _ROUTING_SYSTEM = (
     "3. state_change_possible: is there ANY realistic chance this "
     "message is an explicit instruction to create a goal, change a "
     "goal's status (pause/resume/complete/cancel/archive), or change "
-    "the Mission? Another, more careful pass makes the real call — say "
+    "the Mission? A request that names a clock time/date alongside a "
+    "scheduling verb ('add an event at 3pm titled X', 'schedule Y for "
+    "tomorrow') is a calendar capability candidate (see #4 below), NOT "
+    "a goal to create, even though it also names an activity that could "
+    "superficially look like a Task title — the presence of a time is "
+    "the signal that this belongs to #4, not here. Another, more "
+    "careful pass makes the real call — say "
     "true whenever genuinely unsure, since a false here means that pass "
     "never runs and a real command is silently dropped. Also say true "
     "if you're shown recent conversation this session that ends with "
@@ -163,8 +179,31 @@ _ROUTING_SYSTEM = (
     "false for ordinary questions, small talk, or anything that isn't "
     "plausibly an instruction to change Goal/Mission state or an answer "
     "to Jarvis's own pending question about one.\n\n"
+    "4. capability_invocation_possible: is there ANY realistic chance "
+    "this message is an explicit instruction to invoke one of this "
+    "system's registered Capabilities (e.g. 'touch my Build Jarvis "
+    "goal', 'mark that I reviewed the exam goal', 'add an event today "
+    "at 3pm titled Standup', 'what's on my calendar this week') — never "
+    "inferred from mood, venting, or ambient conversation. A request "
+    "that names a clock time/date alongside a scheduling verb ('add', "
+    "'schedule', 'book', 'create an event') is a calendar capability "
+    "candidate, not a Goal/Task — don't let it read as goal-like just "
+    "because it also describes an activity ('studying session', "
+    "'workout'); the presence of a time is the signal. Another, more "
+    "careful pass makes the real call and checks it against what's "
+    "actually registered — say true whenever genuinely unsure, since a "
+    "false here means that pass never runs and a real command is "
+    "silently dropped. Also say true if recent conversation this "
+    "session ends with Jarvis asking a clarifying question about which "
+    "capability, which goal, or which calendar account/time range was "
+    "meant, and the current message could plausibly be answering it. "
+    "Say false for ordinary questions, small talk, or a state-change "
+    "instruction already covered by #3 above (creating a goal, "
+    "changing its status, or changing the Mission are handled there, "
+    "not here).\n\n"
     'Respond ONLY with JSON: {"needs_reasoning": bool, '
-    '"memory_candidate_possible": bool, "state_change_possible": bool}.'
+    '"memory_candidate_possible": bool, "state_change_possible": bool, '
+    '"capability_invocation_possible": bool}.'
 )
 
 _CONVERSATIONAL_SYSTEM = (
@@ -183,7 +222,17 @@ _CONVERSATIONAL_SYSTEM = (
     "scheduled, set, tracked, or done anything persistent, even if the "
     "user asks you to, unless you were explicitly told that capability is "
     "available to you right now. If you can't do something, say so "
-    "plainly instead of pretending you did. You will also be shown recent "
+    "plainly instead of pretending you did. One specific case needs care "
+    "here: if asked whether a real Goal's status COULD change to "
+    "something else (e.g. 'can this archived goal become active again', "
+    "'what can I do with a cancelled goal') and you have no real "
+    "transition-rule data in front of you in this reply, do NOT guess a "
+    "confident yes or no, and NEVER say a blanket 'I don't have the "
+    "ability to modify goals' — that's false, this system can and does "
+    "change goal statuses through natural language elsewhere. Say "
+    "plainly you're not certain of that specific status's rule without "
+    "checking, rather than a false blanket incapacity claim. You will "
+    "also be shown recent "
     "turns from this same conversation session — you may naturally use "
     "anything the user told you earlier in this session (e.g. a name they "
     "asked you to use), but this context does not survive past this "
@@ -272,6 +321,13 @@ _ACTION_CLAIM_VERBS = {
     "stored", "keep", "kept", "update", "updated", "jot", "jotted",
 }
 _ACTION_CLAIM_SUBJECTS = re.compile(r"\b(i've|i have|i'll|i will|ive|i'm going to|im going to)\b")
+# See _claims_unbacked_action's 2026-08-28 revision note: matches the
+# "what I('ve| have) ... V" relative-clause shape ("based on what I
+# have stored", "from what I've recorded") that names EXISTING content
+# rather than narrating a new action.
+_RECALLS_EXISTING_MEMORY = re.compile(
+    r"\bwhat\s+i(?:'ve| have)\b(?:\s+\S+){0,4}\s+(?:" + "|".join(sorted(_ACTION_CLAIM_VERBS)) + r")\b"
+)
 
 # Found in dogfooding, 2026-08-10: the responder told the user their
 # capabilities were "listed for you under the Mission tab" — a fully
@@ -351,24 +407,90 @@ def _leaks_reasoning_preamble(reply: str) -> bool:
     return bool(_REASONING_STEP_RE.search(head))
 
 
-def _capability_grounding() -> str:
+def _capability_grounding(
+    executed_capability_id: Optional[str] = None,
+    pending_capability_id: Optional[str] = None,
+    relay_capability_id: Optional[str] = None,
+) -> str:
+    """V1-M6 dogfooding fix (2026-09-01): this used to be a single
+    blanket sentence — "None of these are available to you in this
+    conversational reply... no ability to call any capability... right
+    now" — appended UNCONDITIONALLY, every turn, even a turn where a
+    capability had just genuinely executed seconds earlier. That
+    directly contradicted the "Action just taken this turn... say so
+    as something you just did" block appended right after it in the
+    same prompt (see _conversational_reply/_grounded_reply) — two
+    flatly opposed claims in one prompt. Observed live: fs.read
+    executed successfully, was handed real file content to relay, and
+    the reply said "I don't have the ability to read the file right
+    now, but from the snippet you shared, it's..." — the model
+    resolved the contradiction by believing the unconditional blanket
+    claim over the per-turn fact. This isn't fs-specific — it's the
+    same prompt for every registered capability (goals.advance, M5's
+    calendar.*), so any capability relaying a real result in the same
+    turn it executed would hit the identical contradiction.
+
+    Fix: no more blanket claim. Every registered capability gets an
+    honest, capability-specific status line for THIS turn — executed /
+    awaiting confirmation / in-progress (clarify or refused) / simply
+    not used — computed from what actually happened this turn
+    (handle()'s capability_candidate / capability_executed /
+    pending_capability_invocations / capability_relay), not a
+    once-true-at-a-different-layer generalization repeated regardless
+    of the facts.
+    """
     caps = list_capabilities()
     if not caps:
         return "No capabilities are registered in this system at all right now."
-    names = "; ".join(f"{c.id} ({c.description})" for c in caps)
-    return (
-        f"Capabilities that exist in this system: {names}. None of these "
-        "are available to you in this conversational reply — you are "
-        "generating text only, with no ability to call any capability, "
-        "save anything, or take any action right now."
-    )
+    lines = []
+    for c in caps:
+        if c.id == executed_capability_id:
+            status = "JUST EXECUTED this turn — its result is given to you below as a fact, not a guess"
+        elif c.id == pending_capability_id:
+            status = "invoked this turn but awaiting the user's y/N confirmation, shown to them separately — not done yet"
+        elif c.id == relay_capability_id:
+            status = "invoked this turn but not finished yet (see the note below) — not something you lack the ability to do"
+        else:
+            status = "available via natural language in this system, just not invoked this turn"
+        lines.append(f"{c.id} ({c.description}) — {status}")
+    return "Capabilities that exist in this system: " + "; ".join(lines) + "."
 
 
 def _claims_unbacked_action(reply: str) -> bool:
+    """Revision 2026-08-28: "based on what I have stored, you're focused
+    on..." — a correct, accurate answer to "what can you tell about
+    me?", recalling PRE-EXISTING durable memory exactly the way
+    _CONVERSATIONAL_SYSTEM's own know-about-me instruction wants — was
+    rejected by this guard. Root cause: the subject check
+    (_ACTION_CLAIM_SUBJECTS) and the verb check (_ACTION_CLAIM_VERBS)
+    each run independently over the WHOLE reply, with no requirement
+    that they're even grammatically related, let alone that the verb
+    narrates a NEW action rather than naming EXISTING content. "what I
+    have stored" is a relative clause — "the things I have stored" — not
+    a narrated action ("I have stored [x] for you"), but "i have" +
+    "stored" both matched somewhere in the text was enough to trip it.
+    The very next turn in the same live session used "I know you are…"
+    instead of "based on what I have stored…" and escaped the guard
+    entirely, despite making the exact same kind of claim — this was
+    never a real distinction, just a lucky one.
+
+    Fix: exempt the "what I('ve| have) ... V" recall construction
+    specifically, rather than loosen the guard generally. Known,
+    accepted limitation, same cost trade-off as every other guard
+    revision in this file: a reply containing BOTH a legitimate recall
+    phrase AND a separate, genuine false claim elsewhere would now slip
+    through uncaught. Accepted because a missed detection here still
+    only costs skipping the honest fallback in favor of whatever the
+    model actually said — not nothing, but a real answer to "what do
+    you know about me" being replaced by a boilerplate non-answer, on
+    every single occurrence, was actively defeating a feature this
+    system already explicitly commits to (2026-08-17 entry)."""
     lowered = reply.lower()
     if not _ACTION_CLAIM_SUBJECTS.search(lowered):
         return False
-    return any(re.search(rf"\b{v}\b", lowered) for v in _ACTION_CLAIM_VERBS)
+    if not any(re.search(rf"\b{v}\b", lowered) for v in _ACTION_CLAIM_VERBS):
+        return False
+    return not _RECALLS_EXISTING_MEMORY.search(lowered)
 
 
 # Note (2026-08-09, deliberate, not an oversight): session-context below
@@ -624,6 +746,7 @@ class ConversationOutcome:
     response_text: str
     pending_memories: list[PendingMemoryConfirmation] = field(default_factory=list)
     pending_state_changes: list[PendingStateChangeConfirmation] = field(default_factory=list)
+    pending_capability_invocations: list[PendingCapabilityConfirmation] = field(default_factory=list)
 
 
 def _strip_markdown_formatting(text: str) -> str:
@@ -678,10 +801,16 @@ class RouteDecision:
     V1-M2: state_change_possible added as a third field on this SAME
     call, same reasoning as memory_candidate_possible's addition —
     one more unconditional LLM call per message is exactly the latency
-    regression the 2026-08-15b fix exists to prevent."""
+    regression the 2026-08-15b fix exists to prevent.
+
+    V1-M4: capability_invocation_possible added as a fourth field, same
+    call, same reasoning again — per the milestone brief, "one routing
+    call, not a new one" (ARCHITECTURE_ISSUES.md 2026-08-15b) shouldn't
+    need discovering a fourth time."""
     needs_reasoning: bool
     memory_candidate_possible: bool
     state_change_possible: bool
+    capability_invocation_possible: bool
 
 
 async def _route(user_text: str, recent_context: Optional[str] = None) -> RouteDecision:
@@ -713,31 +842,39 @@ async def _route(user_text: str, recent_context: Optional[str] = None) -> RouteD
         and isinstance(result.get("needs_reasoning"), bool)
         and isinstance(result.get("memory_candidate_possible"), bool)
         and isinstance(result.get("state_change_possible"), bool)
+        and isinstance(result.get("capability_invocation_possible"), bool)
     ):
         return RouteDecision(
-            result["needs_reasoning"], result["memory_candidate_possible"], result["state_change_possible"]
+            result["needs_reasoning"], result["memory_candidate_possible"],
+            result["state_change_possible"], result["capability_invocation_possible"],
         )
     # §3: safer default on failure/garbage for needs_reasoning — an
     # under-grounded conversational answer risks accidentally asserting
     # something about the user's actual goals (BUG-M6-01's failure
     # class); routing into the rigorous path costs nothing but a
     # slightly more formal answer. Same logic for
-    # memory_candidate_possible and state_change_possible: failing
-    # closed to False would silently drop real content with no second
-    # chance (unlike needs_reasoning, there's no downstream recovery),
-    # so both fail OPEN to True instead — worst case is one avoidable
+    # memory_candidate_possible, state_change_possible, and (V1-M4)
+    # capability_invocation_possible: failing closed to False would
+    # silently drop real content with no second chance (unlike
+    # needs_reasoning, there's no downstream recovery), so all three
+    # fail OPEN to True instead — worst case is one avoidable
     # extraction call, not a lost memory or a silently-ignored command.
     log.info(
         "Conversation routing LLM call unavailable/invalid — defaulting "
         "to needs_reasoning=True, memory_candidate_possible=True, "
-        "state_change_possible=True"
+        "state_change_possible=True, capability_invocation_possible=True"
     )
-    return RouteDecision(needs_reasoning=True, memory_candidate_possible=True, state_change_possible=True)
+    return RouteDecision(
+        needs_reasoning=True, memory_candidate_possible=True,
+        state_change_possible=True, capability_invocation_possible=True,
+    )
 
 
 async def _conversational_reply(
     user_text: str, mission: Mission, memory_grounding: Optional[str] = None, relay_note: Optional[str] = None,
     recent: Optional[list[ConversationTurn]] = None,
+    executed_capability_id: Optional[str] = None, pending_capability_id: Optional[str] = None,
+    relay_capability_id: Optional[str] = None,
 ) -> str:
     # 2026-08-27: recent is now an optional pass-through from handle()
     # (which needs its own copy for _route()/extract_state_change) —
@@ -748,7 +885,7 @@ async def _conversational_reply(
     known_memories = await _format_known_memories()
     prompt = (
         f"Mission: {mission.title}\n"
-        f"Capabilities: {_capability_grounding()}\n"
+        f"Capabilities: {_capability_grounding(executed_capability_id, pending_capability_id, relay_capability_id)}\n"
         f"Interface: {_REAL_INTERFACE}\n"
         f"What you know about the user (durable memory, persists across "
         f"sessions — distinct from the recent-conversation section below):\n{known_memories}\n"
@@ -793,7 +930,7 @@ async def _conversational_reply(
         # and never claim the thing is already done, since for
         # ASK_CONFIRMATION it explicitly is NOT done yet.
         prompt += (
-            f"Jarvis is actively handling a Goal/Mission command from the "
+            f"Jarvis is actively handling a requested command from the "
             f"user right now and it isn't finished yet — this is a "
             f"normal in-progress step, not something Jarvis lacks the "
             f"ability to do, so don't tell the user you can't do this. "
@@ -820,20 +957,20 @@ async def _conversational_reply(
     if _leaks_reasoning_preamble(reply):
         log.warning(
             "Conversational reply rejected — leaked a raw chain-of-thought "
-            "preamble instead of a final answer (reasoning-leak guard); "
-            "using generic fallback"
+            f"preamble instead of a final answer (reasoning-leak guard); "
+            f"using generic fallback: {reply!r}"
         )
         return _MALFORMED_REPLY_FALLBACK
     if _claims_unbacked_action(reply) and not memory_grounding:
         log.warning(
             "Conversational reply rejected — claimed an action this path cannot "
-            "perform (capability-claim guard); using honest fallback"
+            f"perform (capability-claim guard); using honest fallback: {reply!r}"
         )
         return _CANNOT_PERSIST_REPLY
     if _mentions_fabricated_ui(reply):
         log.warning(
             "Conversational reply rejected — referenced a UI element that doesn't "
-            "exist (fabricated-UI guard); using honest fallback"
+            f"exist (fabricated-UI guard); using honest fallback: {reply!r}"
         )
         return _NO_GUI_REPLY
     return _strip_markdown_formatting(reply)
@@ -949,6 +1086,8 @@ async def _persist_grounded_decision(user_text: str, response_text: str, context
 async def _grounded_reply(
     user_text: str, mission, memory_grounding: Optional[str] = None, relay_note: Optional[str] = None,
     recent: Optional[list[ConversationTurn]] = None,
+    executed_capability_id: Optional[str] = None, pending_capability_id: Optional[str] = None,
+    relay_capability_id: Optional[str] = None,
 ) -> str:
     """Replaces orchestrator.api.run_request() on the conversational
     path (2026-08-2X — see ARCHITECTURE_ISSUES.md and this module's
@@ -960,6 +1099,7 @@ async def _grounded_reply(
     if recent is None:
         recent = await _recent_turns()
     prompt = (
+        f"Capabilities: {_capability_grounding(executed_capability_id, pending_capability_id, relay_capability_id)}\n"
         f"Evidence: {evidence}\n"
         f"Recent conversation this session:\n{_format_recent_context(recent)}\n"
     )
@@ -980,7 +1120,7 @@ async def _grounded_reply(
         # _apply_state_change_policy's docstring for the 2026-08-27
         # round-2 dogfooding bug this fixes.
         prompt += (
-            f"Jarvis is actively handling a Goal/Mission command from the "
+            f"Jarvis is actively handling a requested command from the "
             f"user right now and it isn't finished yet — don't tell the "
             f"user you can't do this, and don't say or imply it's already "
             f"done either. Just address this naturally: {relay_note}\n"
@@ -1003,22 +1143,31 @@ async def _grounded_reply(
     # diagnose than it needed to be, since the log couldn't say which
     # guard actually fired. Matches reasoning/api.py's own
     # _enhance_with_llm, which never had this problem.
+    #
+    # 2026-08-27: the rejected `reply` text itself is now included too
+    # — found the hard way, twice, that "which guard fired" still isn't
+    # enough to tell a genuine catch from a new false-positive shape a
+    # guard doesn't cover yet (e.g. a goal literally titled "Test" is a
+    # common English word the substring-matching guards can collide
+    # with in ordinary unrelated sentences). Without the actual text,
+    # diagnosing a rejection meant reconstructing the live scenario from
+    # scratch; with it, the log alone answers the question.
     if _looks_garbled(reply):
-        log.warning("Grounded reply rejected — output looks garbled/corrupted; using plain evidence fallback")
+        log.warning(f"Grounded reply rejected — output looks garbled/corrupted; using plain evidence fallback: {reply!r}")
         reply = _render_evidence_plainly(context_items, mission)
     elif _asserts_unsupported_relationship(reply, context_items):
         log.warning(
             "Grounded reply rejected — asserted a goal relationship not present in "
-            "the data (BUG-M6-01 guard); using plain evidence fallback"
+            f"the data (BUG-M6-01 guard); using plain evidence fallback: {reply!r}"
         )
         reply = _render_evidence_plainly(context_items, mission)
     elif _asserts_wrong_mission(reply, mission, context_items):
-        log.warning("Grounded reply rejected — conflated a Goal with the Mission; using plain evidence fallback")
+        log.warning(f"Grounded reply rejected — conflated a Goal with the Mission; using plain evidence fallback: {reply!r}")
         reply = _render_evidence_plainly(context_items, mission)
     elif _asserts_wrong_status(reply, context_items):
         log.warning(
             "Grounded reply rejected — called a goal 'active' when its real status "
-            "says otherwise; using plain evidence fallback"
+            f"says otherwise; using plain evidence fallback: {reply!r}"
         )
         reply = _render_evidence_plainly(context_items, mission)
 
@@ -1101,43 +1250,109 @@ async def handle(user_text: str) -> ConversationOutcome:
     # state_change/extraction.py's own LLM call only fires, when the
     # single combined routing call already thinks a state-change
     # command is plausible.
+    # V1-M4, same latency discipline: known_goals is reused from the
+    # state-change fetch above when both flags fire this turn (a DB
+    # read, not an LLM call, so sharing it doesn't reopen the 2026-08-15b
+    # latency fix — it just avoids two identical queries in one turn).
     if route.state_change_possible:
-        known_goals = await list_goals(mission_id=mission.identity_id)
+        known_goals_for_state_change = await list_goals(mission_id=mission.identity_id)
         state_candidate = await extract_state_change(
             user_text,
-            known_goals=[(g.title, g.id, g.status.value) for g in known_goals],
+            known_goals=[(g.title, g.id, g.status.value) for g in known_goals_for_state_change],
             active_mission_title=mission.title,
             recent_context=recent_context,
         )
     else:
+        known_goals_for_state_change = None
         state_candidate = None
     state_change_executed, state_change_relay, pending_state_changes = await _apply_state_change_policy(
         state_candidate
     )
 
-    # Only completed-write facts get merged and framed as "this
-    # happened" — state_change_relay (a clarifying question or a
-    # rejection explanation) is NOT a fact and must stay in its own
-    # labeled block, or the reply model treats a pending question as
-    # something already done. See _apply_state_change_policy's
-    # docstring for the dogfooding bug (2026-08-26) this fixes.
-    combined_grounding = "\n".join(g for g in (memory_grounding, state_change_executed) if g) or None
+    if route.capability_invocation_possible:
+        known_goals_for_capability = (
+            known_goals_for_state_change
+            if known_goals_for_state_change is not None
+            else await list_goals(mission_id=mission.identity_id)
+        )
+        capability_candidate = await extract_capability_invocation(
+            user_text,
+            capabilities=list_capabilities(),
+            known_goals=[(g.title, g.id, g.status.value) for g in known_goals_for_capability],
+            recent_context=recent_context,
+            current_directory=get_fs_current_directory(),
+            # M5: known_accounts is a config read, not a DB query (see
+            # config/default.yaml's calendar.accounts) — cheap enough to
+            # load on every capability-invocation turn, same reasoning
+            # known_goals_for_capability above already applies to reusing
+            # rather than re-fetching where it's free to.
+            known_accounts=load_config().get("calendar.accounts", []),
+            # Dogfooding fix 2026-09-08: user.timezone (config/default.yaml)
+            # — without this, extraction.py had no way to know what the
+            # user meant by a bare time like "12 pm" and could only anchor
+            # to UTC, producing a correct-looking but wrong-instant ISO
+            # datetime (see V1_M5_IMPLEMENTATION_RECORD.md's 2026-09-08
+            # entry). Defaults to "UTC" — same fail-closed shape as every
+            # other optional config read in this call.
+            user_timezone=load_config().get("user.timezone", "UTC"),
+        )
+    else:
+        capability_candidate = None
+    capability_executed, capability_relay, pending_capability_invocations = await resolve_capability_invocation(
+        capability_candidate
+    )
+
+    # Only completed-write/completed-run facts get merged and framed as
+    # "this happened" — a relay note (a clarifying question, a pending
+    # confirmation, or a rejection explanation) is NOT a fact and must
+    # stay in its own labeled block, or the reply model treats a
+    # pending question as something already done. See
+    # _apply_state_change_policy's docstring for the dogfooding bug
+    # (2026-08-26) this fixes; V1-M4's capability_executed/
+    # capability_relay follow the exact same contract.
+    combined_grounding = "\n".join(
+        g for g in (memory_grounding, state_change_executed, capability_executed) if g
+    ) or None
+    combined_relay = "\n".join(r for r in (state_change_relay, capability_relay) if r) or None
+
+    # V1-M6 dogfooding fix (2026-09-01): which capability (if any) has a
+    # real, turn-specific status to report — feeds _capability_grounding
+    # via the reply calls below, replacing the old blanket "none of
+    # these are available" claim. Derived from the signals already
+    # computed above; capability_candidate.capability_id can be None
+    # (no capability invocation extracted this turn at all), in which
+    # case all three stay None and every capability just gets the
+    # default "not invoked this turn" status.
+    executed_capability_id = pending_capability_id = relay_capability_id = None
+    if capability_candidate is not None and capability_candidate.capability_id is not None:
+        if pending_capability_invocations:
+            pending_capability_id = capability_candidate.capability_id
+        elif capability_executed is not None:
+            executed_capability_id = capability_candidate.capability_id
+        elif capability_relay is not None:
+            relay_capability_id = capability_candidate.capability_id
 
     if route.needs_reasoning:
         response_text = await _grounded_reply(
-            user_text, mission, memory_grounding=combined_grounding, relay_note=state_change_relay, recent=recent
+            user_text, mission, memory_grounding=combined_grounding, relay_note=combined_relay, recent=recent,
+            executed_capability_id=executed_capability_id, pending_capability_id=pending_capability_id,
+            relay_capability_id=relay_capability_id,
         )
         await _archive(user_text, response_text, "reasoning", turn_id=turn_id)
         return ConversationOutcome(
             routed_to="reasoning", response_text=response_text,
             pending_memories=pending_memories, pending_state_changes=pending_state_changes,
+            pending_capability_invocations=pending_capability_invocations,
         )
 
     response = await _conversational_reply(
-        user_text, mission, memory_grounding=combined_grounding, relay_note=state_change_relay, recent=recent
+        user_text, mission, memory_grounding=combined_grounding, relay_note=combined_relay, recent=recent,
+        executed_capability_id=executed_capability_id, pending_capability_id=pending_capability_id,
+        relay_capability_id=relay_capability_id,
     )
     await _archive(user_text, response, "conversation", turn_id=turn_id)
     return ConversationOutcome(
         routed_to="conversation", response_text=response,
         pending_memories=pending_memories, pending_state_changes=pending_state_changes,
+        pending_capability_invocations=pending_capability_invocations,
     )
