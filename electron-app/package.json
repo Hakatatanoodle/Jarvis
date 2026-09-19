@@ -1,0 +1,12 @@
+{
+  "name": "nika-desktop",
+  "version": "0.1.0",
+  "description": "Nika desktop UI — Electron shell over the local FastAPI backend (see ../jarvis/server/app.py).",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}
