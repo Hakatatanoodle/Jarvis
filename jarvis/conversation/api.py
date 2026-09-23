@@ -99,12 +99,19 @@ log = get_logger("conversation.api")
 _SESSION_ID = str(uuid4())
 _RECENT_TURNS_LIMIT = 6
 
-_ONBOARDING_MESSAGE = (
+_ONBOARDING_MESSAGE_TERMINAL = (
     "Hey — I don't have a Mission set for you yet, so I can't help you plan "
     "or reflect on anything until I know what you're working toward.\n\n"
     "Run /mission set <title> | <statement> to get started, or /help to see "
     "everything I can do."
 )
+_ONBOARDING_MESSAGE_GUI = (
+    "Hey — I don't have a Mission set for you yet, so I can't help you plan "
+    "or reflect on anything until I know what you're working toward.\n\n"
+    "Open the Mission tab in the sidebar to set one, or just tell me here "
+    "what you're working toward and I'll help you shape it."
+)
+_ONBOARDING_MESSAGE = _ONBOARDING_MESSAGE_TERMINAL  # kept as the default export used elsewhere
 
 # §3: small, tight, unambiguous set — anything longer or less certain
 # falls through to the LLM routing check instead of guessing here.
@@ -184,7 +191,10 @@ _ROUTING_SYSTEM = (
     "system's registered Capabilities (e.g. 'touch my Build Nika "
     "goal', 'mark that I reviewed the exam goal', 'add an event today "
     "at 3pm titled Standup', 'what's on my calendar this week', 'read "
-    "the README.md file in this repo', 'what's in config.yaml') — never "
+    "the README.md file in this repo', 'what's in config.yaml', 'search "
+    "the web for X', 'look up the latest on X online', 'remind me to "
+    "call mom at 5pm', 'what reminders do I have', 'cancel my call mom "
+    "reminder') — never "
     "inferred from mood, venting, or ambient conversation. This "
     "includes a filesystem read/write buried inside a longer or "
     "compound request — 'can you read the README.md file and tell me "
@@ -287,10 +297,9 @@ _CONVERSATIONAL_SYSTEM = (
     "address them by it naturally rather than a generic title like "
     "'boss' or 'man' — use the generic title only if they've explicitly "
     "said they prefer it, or their name genuinely isn't known yet. You "
-    "will also be told the real interface this system has — NEVER refer "
-    "to a UI element (tab, menu, button, dashboard, etc.) that isn't "
-    "actually one of the listed slash commands; this is a terminal-only "
-    "system with no graphical interface at all."
+    "will also be told the real interface this system has, in the "
+    "Interface line below — NEVER refer to a UI element that isn't "
+    "actually described there."
 )
 _FALLBACK_REPLY = "Hey — I'm here, just couldn't reach a language model for that reply. What can I help with?"
 _CANNOT_PERSIST_REPLY = (
@@ -299,12 +308,85 @@ _CANNOT_PERSIST_REPLY = (
     "goals, mission, and planning — try /goal, /mission, /memory, or "
     "just ask me what to work on."
 )
-_NO_GUI_REPLY = (
-    "Just to be accurate — there's no menu or screen for that. This is a "
-    "terminal-only system right now: /mission, /goal, /memory, /status, "
-    "/decision, and /help are the whole interface."
+@dataclass(frozen=True)
+class Interface:
+    """Describes the real interface the current call is coming through
+    — cli.py's terminal, or the Electron desktop app via server/app.py
+    — so the honesty guards below stay true for whichever one is
+    actually calling handle(). Threaded from handle() down into
+    _conversational_reply, defaulting to TERMINAL everywhere so cli.py
+    and every existing test needs zero changes (see V1-UI's
+    implementation record for the "Nika thinks it has no GUI" bug this
+    fixes — the old constants asserted terminal-only unconditionally,
+    which became false the moment a second frontend existed)."""
+    description: str
+    fabricated_terms: frozenset
+    wrong_ui_reply: str
+    onboarding_message: str
+
+
+TERMINAL_INTERFACE = Interface(
+    description=(
+        "The ONLY interface that exists is this terminal, via slash commands: "
+        "/mission, /goal, /memory, /status, /decision, /help. There is no "
+        "GUI, no tabs, no menus, no buttons, no dashboard, no app, no website "
+        "— nothing but this terminal. NEVER refer the user to a UI element "
+        "that isn't one of these slash commands. This is also a PLAIN TEXT "
+        "terminal — Markdown doesn't render here, so never use '#' headers, "
+        "'**bold**', or horizontal rules ('---'); plain sentences only."
+    ),
+    fabricated_terms=frozenset({
+        "tab", "tabs", "menu", "button", "dashboard", "sidebar", "dropdown",
+        "checkbox", "toggle", "settings page",
+    }),
+    wrong_ui_reply=(
+        "Just to be accurate — there's no menu or screen for that. This is a "
+        "terminal-only system right now: /mission, /goal, /memory, /status, "
+        "/decision, and /help are the whole interface."
+    ),
+    onboarding_message=_ONBOARDING_MESSAGE_TERMINAL,
+)
+# Back-compat alias — tests and any external reader that used the old
+# module-level constant still work; TERMINAL_INTERFACE.description is
+# the single source of truth now.
+_REAL_INTERFACE = TERMINAL_INTERFACE.description
+
+# Electron desktop app (server/app.py). Real elements only: a Chat view
+# (this conversation); a sidebar with Goals/Mission/Memory/Decisions/
+# Logs tabs, each reading live from those systems directly, not routed
+# through chat; inline approve/reject cards in this chat thread for
+# pending memory, goal/mission-change, and capability confirmations;
+# and a status bar showing the active Mission. Keep fabricated_terms
+# covering anything NOT yet built (settings page, voice, notifications,
+# mobile/web) so the guard still catches genuine invention.
+GUI_INTERFACE = Interface(
+    description=(
+        "This is the Nika desktop app (Electron), not a terminal. The real "
+        "interface is: a Chat view (this conversation); a sidebar with "
+        "Goals, Mission, Memory, Decisions, and Logs tabs, each showing "
+        "live data directly from those systems; inline approve/reject "
+        "cards that appear in this chat thread for pending memory, goal/"
+        "mission-change, and capability confirmations; and a status bar "
+        "showing the active Mission. There is no settings page, no voice "
+        "input, no notifications, and no mobile or web version yet — "
+        "never refer to any of those. This is still a plain-text chat "
+        "surface — Markdown doesn't render here yet, so never use '#' "
+        "headers, '**bold**', or horizontal rules ('---'); plain "
+        "sentences only."
+    ),
+    fabricated_terms=frozenset({
+        "settings page", "voice command", "notification", "mobile app",
+        "website", "app store", "browser extension",
+    }),
+    wrong_ui_reply=(
+        "Just to be accurate — there's no page or control for that yet in "
+        "the app. Right now it's Chat, plus Goals, Mission, Memory, "
+        "Decisions, and Logs in the sidebar."
+    ),
+    onboarding_message=_ONBOARDING_MESSAGE_GUI,
 )
 _MALFORMED_REPLY_FALLBACK = "Sorry, that came out a bit garbled on my end — could you say that again?"
+
 
 # Layer 2 (guarantee, not just reduce — same pattern as BUG-M6-01):
 # for M1 the conversational path was side-effect-free by construction,
@@ -338,30 +420,19 @@ _RECALLS_EXISTING_MEMORY = re.compile(
 
 # Found in dogfooding, 2026-08-10: the responder told the user their
 # capabilities were "listed for you under the Mission tab" — a fully
-# fabricated UI surface. This system has exactly one interface: this
-# terminal and its slash commands. No tabs, menus, buttons, or screens
-# exist anywhere. Different failure class from the action-claim guard
-# above (that catches false persistence claims; this catches false
-# claims about the product itself) — same "structured grounding +
-# deterministic check" shape, applied to a different hallucination.
-_REAL_INTERFACE = (
-    "The ONLY interface that exists is this terminal, via slash commands: "
-    "/mission, /goal, /memory, /status, /decision, /help. There is no "
-    "GUI, no tabs, no menus, no buttons, no dashboard, no app, no website "
-    "— nothing but this terminal. NEVER refer the user to a UI element "
-    "that isn't one of these slash commands. This is also a PLAIN TEXT "
-    "terminal — Markdown doesn't render here, so never use '#' headers, "
-    "'**bold**', or horizontal rules ('---'); plain sentences only."
-)
-_FABRICATED_UI_TERMS = {
-    "tab", "tabs", "menu", "button", "dashboard", "sidebar", "dropdown",
-    "checkbox", "toggle", "settings page",
-}
+# fabricated UI surface at the time (terminal-only). Different failure
+# class from the action-claim guard above (that catches false
+# persistence claims; this catches false claims about the product
+# itself) — same "structured grounding + deterministic check" shape,
+# applied to a different hallucination. What actually counts as
+# "fabricated" now depends on which frontend is calling handle() — see
+# the Interface dataclass and TERMINAL_INTERFACE/GUI_INTERFACE above.
 
 
-def _mentions_fabricated_ui(reply: str) -> bool:
+def _mentions_fabricated_ui(reply: str, interface: Interface = TERMINAL_INTERFACE) -> bool:
     lowered = reply.lower()
-    return any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in _FABRICATED_UI_TERMS)
+    return any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in interface.fabricated_terms)
+
 
 
 # Found in dogfooding, 2026-08-10: a reply started with the literal line
@@ -895,7 +966,7 @@ async def _conversational_reply(
     user_text: str, mission: Mission, memory_grounding: Optional[str] = None, relay_note: Optional[str] = None,
     recent: Optional[list[ConversationTurn]] = None,
     executed_capability_id: Optional[str] = None, pending_capability_id: Optional[str] = None,
-    relay_capability_id: Optional[str] = None,
+    relay_capability_id: Optional[str] = None, interface: Interface = TERMINAL_INTERFACE,
 ) -> str:
     # 2026-08-27: recent is now an optional pass-through from handle()
     # (which needs its own copy for _route()/extract_state_change) —
@@ -907,7 +978,7 @@ async def _conversational_reply(
     prompt = (
         f"Mission: {mission.title}\n"
         f"Capabilities: {_capability_grounding(executed_capability_id, pending_capability_id, relay_capability_id)}\n"
-        f"Interface: {_REAL_INTERFACE}\n"
+        f"Interface: {interface.description}\n"
         f"What you know about the user (durable memory, persists across "
         f"sessions — distinct from the recent-conversation section below):\n{known_memories}\n"
         f"Recent conversation this session:\n{_format_recent_context(recent)}\n"
@@ -988,12 +1059,12 @@ async def _conversational_reply(
             f"perform (capability-claim guard); using honest fallback: {reply!r}"
         )
         return _CANNOT_PERSIST_REPLY
-    if _mentions_fabricated_ui(reply):
+    if _mentions_fabricated_ui(reply, interface):
         log.warning(
             "Conversational reply rejected — referenced a UI element that doesn't "
             f"exist (fabricated-UI guard); using honest fallback: {reply!r}"
         )
-        return _NO_GUI_REPLY
+        return interface.wrong_ui_reply
     return _strip_markdown_formatting(reply)
 
 
@@ -1028,8 +1099,9 @@ _GROUNDED_SYSTEM = (
     "together, not something that gets scheduled or executed on its "
     "own. Don't claim to have created, scheduled, or saved a plan "
     "anywhere; you're proposing one in conversation.\n"
-    "- This is a PLAIN TEXT TERMINAL, not a rendered chat UI — Markdown "
-    "does not render here. NEVER use '#'/'##' headers, '**bold**', "
+    "- This is a plain-text interface, not a Markdown-rendering one — "
+    "Markdown does not render here, whether the user is on the terminal "
+    "or the desktop app. NEVER use '#'/'##' headers, '**bold**', "
     "horizontal rules ('---'), or any other Markdown syntax; it will "
     "show up as ugly literal symbols, not formatting. For a multi-part "
     "answer like a schedule or a plan, use plain numbered steps ('1.', "
@@ -1218,17 +1290,18 @@ async def _archive(
         )
 
 
-async def handle(user_text: str) -> ConversationOutcome:
+async def handle(user_text: str, interface: Interface = TERMINAL_INTERFACE) -> ConversationOutcome:
     mission = await get_active_mission()
     if mission is None:
-        await _archive(user_text, _ONBOARDING_MESSAGE, "conversation")
-        return ConversationOutcome(routed_to="conversation", response_text=_ONBOARDING_MESSAGE)
+        onboarding = interface.onboarding_message
+        await _archive(user_text, onboarding, "conversation")
+        return ConversationOutcome(routed_to="conversation", response_text=onboarding)
 
     if _matches_fast_path_greeting(user_text):
         # Never memory-worthy by construction (word list is all
         # greetings/fillers, see _GREETING_WORDS) — skip the extraction
         # call entirely rather than pay for an LLM round-trip on "hi".
-        response = await _conversational_reply(user_text, mission)
+        response = await _conversational_reply(user_text, mission, interface=interface)
         await _archive(user_text, response, "conversation")
         return ConversationOutcome(routed_to="conversation", response_text=response)
 
@@ -1369,7 +1442,7 @@ async def handle(user_text: str) -> ConversationOutcome:
     response = await _conversational_reply(
         user_text, mission, memory_grounding=combined_grounding, relay_note=combined_relay, recent=recent,
         executed_capability_id=executed_capability_id, pending_capability_id=pending_capability_id,
-        relay_capability_id=relay_capability_id,
+        relay_capability_id=relay_capability_id, interface=interface,
     )
     await _archive(user_text, response, "conversation", turn_id=turn_id)
     return ConversationOutcome(

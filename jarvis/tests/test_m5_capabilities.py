@@ -28,8 +28,13 @@ pytestmark = pytest.mark.usefixtures("clean_db")
 
 
 async def test_five_primitives_registered():
+    # Capabilities V2 added web.search + reminders.*; the original five must all still be present.
     ids = {c.id for c in list_capabilities()}
-    assert ids == {"fs.read", "fs.write", "calendar.read_events", "calendar.create_event", "goals.advance"}
+    assert ids >= {"fs.read", "fs.write", "calendar.read_events", "calendar.create_event", "goals.advance"}
+    assert ids == {
+        "fs.read", "fs.write", "calendar.read_events", "calendar.create_event", "goals.advance",
+        "web.search", "reminders.create", "reminders.list", "reminders.cancel",
+    }
 
 
 async def _real_plan_id() -> str:

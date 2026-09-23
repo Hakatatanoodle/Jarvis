@@ -33,6 +33,10 @@
   #inputbar { display: flex; padding: 12px; border-top: 1px solid #2a2b31; gap: 8px; }
   #inputbar input { flex: 1; padding: 10px 12px; border-radius: 8px; border: 1px solid #3a3b42; background: #1e1f24; color: #eee; font-size: 14px; }
   #inputbar button { padding: 10px 16px; border-radius: 8px; border: none; background: #3a5a9c; color: #fff; cursor: pointer; }
+  #micbtn { background: #2a2b31; }
+  #micbtn.recording { background: #7a3f3f; }
+  #speakerbtn { background: #2a2b31; }
+  #speakerbtn.muted { opacity: 0.4; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a2b31; }
   h2 { font-size: 15px; color: #c7c8cd; margin: 0 0 12px; }
@@ -52,6 +56,8 @@
     <div id="view"></div>
     <div id="inputbar">
       <input id="chatinput" placeholder="Message Nika…" />
+      <button id="micbtn" title="Hold to talk">🎤</button>
+      <button id="speakerbtn" title="Toggle spoken replies">🔊</button>
       <button id="sendbtn">Send</button>
     </div>
   </div>

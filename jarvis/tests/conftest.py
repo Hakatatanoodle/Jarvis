@@ -36,5 +36,5 @@ async def clean_db(db_pool):
     """Every DB-backed test starts from an empty mission/goal/goal_history
     state, so tests can't leak into each other regardless of order."""
     async with db_pool.acquire() as conn:
-        await conn.execute("TRUNCATE conversation_turn, taxonomy_gap_proposal, insight_record, capability_result, calendar_event, permission_check_result, action, plan, decision, memory_history, memory, goal_history, goal, mission CASCADE;")
+        await conn.execute("TRUNCATE reminder, conversation_turn, taxonomy_gap_proposal, insight_record, capability_result, calendar_event, permission_check_result, action, plan, decision, memory_history, memory, goal_history, goal, mission CASCADE;")
     yield

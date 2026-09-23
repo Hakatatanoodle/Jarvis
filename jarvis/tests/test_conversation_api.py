@@ -999,9 +999,14 @@ async def test_grounded_reply_falls_back_plainly_when_llm_unavailable():
 # since they showed up in the same transcript.
 
 def test_grounded_prompt_forbids_markdown():
+    # Was asserting the literal phrase "plain text terminal" here — that
+    # became false the moment a second (Electron) frontend started
+    # calling handle() too (see UI_IMPLEMENTATION_RECORD.md). The actual
+    # invariant that matters is "no Markdown renders here yet", not
+    # which surface is making the call — assert that instead.
     lowered = _GROUNDED_SYSTEM.lower()
     assert "markdown" in lowered
-    assert "plain text terminal" in lowered
+    assert "terminal" not in lowered
 
 
 def test_conversational_prompt_also_forbids_markdown():
@@ -1013,6 +1018,38 @@ def test_conversational_prompt_also_forbids_markdown():
     # text already lived, so the no-Markdown rule was added alongside it.
     lowered = _REAL_INTERFACE.lower()
     assert "markdown" in lowered
+
+
+def test_gui_interface_does_not_claim_terminal_only():
+    # The bug the architecture review caught: Nika telling an Electron
+    # user "there's no GUI" because the interface description was
+    # hardcoded terminal-only. GUI_INTERFACE must describe the real
+    # surfaces (chat + sidebar tabs + confirmation cards + status bar)
+    # and must not claim there's no graphical interface.
+    from conversation.api import GUI_INTERFACE, TERMINAL_INTERFACE
+    lowered = GUI_INTERFACE.description.lower()
+    assert "no gui" not in lowered
+    assert "terminal-only" not in lowered
+    assert "sidebar" in lowered
+    assert GUI_INTERFACE.onboarding_message != TERMINAL_INTERFACE.onboarding_message
+
+
+async def test_gui_interface_does_not_flag_real_gui_elements():
+    # The core bug: "tab" is fabricated on the terminal (nothing like it
+    # exists there) but real in the desktop app (the sidebar literally
+    # has tabs). Same model output must be judged differently depending
+    # on which interface actually made the call.
+    from conversation.api import GUI_INTERFACE
+    await set_mission(title="Grow", statement="Statement.")
+    reply_mentioning_tab = "You can find that under the Goals tab in the sidebar."
+    with patch("conversation.api.complete_json", new=AsyncMock(return_value={
+        "needs_reasoning": False, "memory_candidate_possible": False,
+        "state_change_possible": False, "capability_invocation_possible": False,
+    })), patch("conversation.api.complete", new=AsyncMock(return_value=reply_mentioning_tab)):
+        terminal_outcome = await handle("where are my goals?")
+        gui_outcome = await handle("where are my goals?", interface=GUI_INTERFACE)
+    assert "tab" not in terminal_outcome.response_text.lower()  # rejected — no tabs on a terminal
+    assert "goals tab" in gui_outcome.response_text.lower()  # accepted — it's real in the app
 
 
 async def test_grounded_reply_uses_a_generous_token_budget():

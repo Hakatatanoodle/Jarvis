@@ -53,6 +53,18 @@ _ACTION_TYPE_BY_CAPABILITY: dict[str, ActionType] = {
     "fs.write": ActionType.WRITE,
     "calendar.read_events": ActionType.READ,
     "calendar.create_event": ActionType.WRITE,
+    # Capabilities V2
+    "web.search": ActionType.READ,
+    "reminders.create": ActionType.WRITE,
+    "reminders.list": ActionType.READ,
+    "reminders.cancel": ActionType.WRITE,
+}
+# Capabilities whose completed output must be folded into the grounding
+# fact (see _completed_detail) — a bare "Ran X." gives the reply model
+# nothing to relay for a search/list, or a time to confirm for a reminder.
+_DETAIL_CAPABILITY_IDS = {
+    "calendar.read_events", "calendar.create_event",
+    "web.search", "reminders.create", "reminders.list", "reminders.cancel",
 }
 _DEFAULT_ACTION_TYPE = ActionType.WRITE  # conservative default for any future capability not yet mapped
 
@@ -236,7 +248,37 @@ def _completed_detail(capability_id: str, output: Optional[dict]) -> str:
     if capability_id == "calendar.create_event":
         link = output.get("html_link")
         return f" Created: {link}" if link else " Created (no link returned)."
+    if capability_id == "web.search":
+        results = output.get("results") or []
+        if not results:
+            return f" No web results found for \"{output.get('query', '')}\"."
+        lines = [f"[{i}] {r['title']} ({r['url']}): {r['snippet'][:200]}" for i, r in enumerate(results, 1)]
+        return (
+            f" Web results for \"{output.get('query', '')}\" — answer from these in your own words, "
+            f"mention which source(s) you used, don't invent details they don't contain: " + " | ".join(lines)
+        )
+    if capability_id == "reminders.create":
+        return f" Reminder set for {_local_str(output.get('due_at'))}: \"{output.get('text')}\"."
+    if capability_id == "reminders.list":
+        rems = output.get("reminders") or []
+        if not rems:
+            return " No pending reminders."
+        return " Pending reminders: " + "; ".join(f"\"{r['text']}\" at {_local_str(r['due_at'])}" for r in rems) + "."
+    if capability_id == "reminders.cancel":
+        return f" Cancelled the reminder \"{output.get('text')}\"."
     return ""
+
+
+def _local_str(iso: Optional[str]) -> str:
+    """Render a stored UTC ISO datetime in the user's configured local
+    timezone for the reply model (falls back to the raw string)."""
+    from zoneinfo import ZoneInfo
+    from config.loader import load_config
+    try:
+        dt = datetime.fromisoformat(iso).astimezone(ZoneInfo(load_config().get("user.timezone", "UTC")))
+        return dt.strftime("%a %d %b %Y, %H:%M %Z")
+    except Exception:
+        return str(iso)
 
 
 async def resolve_and_dispatch(
@@ -397,7 +439,7 @@ async def resolve_and_dispatch(
                     f"{content}"
                 ), None, []
             return f"Ran {capability.name} on {resolved_path}.", None, []
-        if candidate.capability_id in ("calendar.read_events", "calendar.create_event"):
+        if candidate.capability_id in _DETAIL_CAPABILITY_IDS:
             detail = _completed_detail(capability.id, getattr(result, "output", None))
             return f"Ran {capability.name}.{detail}", None, []
         target = f" on \"{candidate.goal_ref}\"" if candidate.goal_ref else ""

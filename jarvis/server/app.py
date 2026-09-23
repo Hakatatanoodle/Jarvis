@@ -16,12 +16,14 @@ Run: uvicorn server.app:app --port 8756
 """
 from __future__ import annotations
 
+import asyncio
+import os
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -35,6 +37,7 @@ from infra.storage import close_pool, init_pool
 from memory import api as memory_api
 from mission import api as mission_api
 from reasoning import api as reasoning_api
+from reminders import api as reminders_api
 
 from contextlib import asynccontextmanager
 
@@ -144,7 +147,7 @@ _PENDING_CACHE: dict[str, tuple[str, Any]] = {}
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    outcome = await conv.handle(req.text)
+    outcome = await conv.handle(req.text, interface=conv.GUI_INTERFACE)
     cards = _normalize_pending(outcome)
     for pm in outcome.pending_memories:
         cid = pm.source_id + ":" + str(id(pm))
@@ -178,6 +181,19 @@ async def resolve_pending(req: ResolveRequest):
     else:
         note = await conv.resolve_pending_capability_invocation(obj, req.approved)
     return {"note": note}
+
+
+# ---------------------------------------------------------------------
+# Reminders (Capabilities V2) — delivery is poll-based. Returns every
+# pending reminder whose due_at has passed and marks each delivered in
+# the same atomic statement, so it is returned exactly once. Polled by
+# electron-app/src/main.js (on launch, on window focus, and on a timer).
+# ---------------------------------------------------------------------
+
+@app.get("/reminders/due")
+async def reminders_due():
+    rems = await reminders_api.pop_due_reminders()
+    return [{"id": r.id, "text": r.text, "due_at": r.due_at.isoformat()} for r in rems]
 
 
 # ---------------------------------------------------------------------
@@ -283,3 +299,147 @@ async def status():
     UI's top status bar (open decision #5)."""
     m = await mission_api.get_active_mission()
     return {"mission": _json_safe(m) if m else None, "ok": True}
+
+
+# ---------------------------------------------------------------------
+# Voice input (STT). Push-to-talk only, no wake-word, no auto-send —
+# the renderer records a clip, posts it here, gets a transcript back,
+# and drops it into the chat input box for the person to review before
+# sending. Local transcription (faster-whisper), not a cloud API: voice
+# never leaves the machine, and it works offline.
+#
+# Requires ffmpeg/libav present on the system for decoding whatever
+# format the browser's MediaRecorder produced (typically webm/opus) —
+# `sudo apt install ffmpeg` on Debian/Ubuntu/Mint if transcription
+# fails with a decode error.
+#
+# Model loads lazily on first request (a few seconds), not at server
+# startup, so a slow model download/load never blocks /status or /chat
+# from working. Size is small on purpose — this laptop is an older
+# Ivy Bridge CPU (see UI_IMPLEMENTATION_RECORD.md's mic debug notes);
+# "base.en" is a reasonable accuracy/speed tradeoff for short
+# push-to-talk clips. Override with NIKA_WHISPER_MODEL if it's too
+# slow or not accurate enough.
+_whisper_model = None
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        import os
+        size = os.environ.get("NIKA_WHISPER_MODEL", "base.en")
+        _whisper_model = WhisperModel(size, device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+@app.post("/voice/transcribe")
+async def transcribe(audio: UploadFile):
+    import tempfile
+
+    suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+    try:
+        model = _get_whisper_model()
+        segments, _info = model.transcribe(tmp_path, language="en")
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+    except Exception as e:
+        raise HTTPException(500, f"transcription failed: {e}")
+    finally:
+        os.unlink(tmp_path)
+    return {"text": text}
+
+
+# ---------------------------------------------------------------------
+# Voice output (TTS). Local synthesis via Piper — no cloud call, works
+# offline, and small enough to run acceptably on an old CPU (see
+# UI_IMPLEMENTATION_RECORD.md — same laptop as the whisper model, same
+# reasoning for staying local and lightweight).
+#
+# Requires a Piper voice model downloaded once, since the ~60MB model
+# files aren't bundled: from
+# https://huggingface.co/rhasspy/piper-voices, grab e.g.
+# en_US-lessac-medium.onnx and en_US-lessac-medium.onnx.json (same
+# folder, same base filename — Piper expects them side by side), then
+# set NIKA_PIPER_VOICE to the .onnx file's path. Without that env var
+# set, /voice/speak returns a clear 500 rather than crashing at import
+# time — TTS is opt-in, not required for the rest of the app to run.
+_piper_voice = None
+
+
+def _get_piper_voice():
+    global _piper_voice
+    if _piper_voice is None:
+        voice_path = os.environ.get("NIKA_PIPER_VOICE")
+        if not voice_path:
+            raise HTTPException(
+                500,
+                "NIKA_PIPER_VOICE is not set — download a Piper voice model "
+                "(see server/app.py's comment above _get_piper_voice) and "
+                "point NIKA_PIPER_VOICE at its .onnx file.",
+            )
+        from piper import PiperVoice
+        _piper_voice = PiperVoice.load(voice_path)
+    return _piper_voice
+
+
+class SpeakRequest(BaseModel):
+    text: str
+
+
+@app.post("/voice/speak")
+async def speak(req: SpeakRequest):
+    # Streams raw 16-bit PCM chunks as Piper generates them, instead of
+    # synthesizing the entire reply into one WAV file before sending
+    # anything — that made even a short reply wait for full synthesis
+    # before any sound started. The renderer plays each chunk the
+    # moment it arrives (see speakText's Web Audio scheduling in
+    # app.js), so playback starts on the first chunk, not the last.
+    #
+    # No WAV container here — just raw PCM — since a WAV header needs
+    # the total byte count up front, which isn't known until synthesis
+    # finishes. Sample rate is sent as a response header instead so the
+    # client knows how to interpret the raw bytes.
+    #
+    # Piper's synthesize() is itself a blocking, CPU-bound generator —
+    # run in a background thread with a queue rather than iterated
+    # directly in the route, so a long reply doesn't stall the event
+    # loop (and every other request, like /status or /chat) while it's
+    # being spoken.
+    import queue
+    import threading
+
+    voice = _get_piper_voice()
+    sample_rate = voice.config.sample_rate
+    q: "queue.Queue" = queue.Queue()
+    _SENTINEL = object()
+
+    def produce():
+        try:
+            for chunk in voice.synthesize(req.text):
+                q.put(chunk.audio_int16_bytes)
+        except Exception as e:  # surfaced to the client via the stream below
+            q.put(e)
+        finally:
+            q.put(_SENTINEL)
+
+    threading.Thread(target=produce, daemon=True).start()
+
+    async def pcm_stream():
+        loop = asyncio.get_event_loop()
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is _SENTINEL:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        pcm_stream(),
+        media_type="application/octet-stream",
+        headers={"X-Sample-Rate": str(sample_rate)},
+    )

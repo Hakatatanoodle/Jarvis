@@ -189,6 +189,20 @@ calendar:
     - work
     - personal
 
+search:
+  # Capabilities V2: web.search (capabilities/primitives/web_ops.py).
+  # Tavily — built for LLM-agent search, free tier (1,000 credits/month,
+  # no card), returns clean content snippets. Key comes from the env var
+  # named below (set it in .env, same as the LLM provider keys); never
+  # put a key in this file.
+  provider: tavily
+  providers:
+    tavily:
+      api_key_env: TAVILY_API_KEY
+      base_url: https://api.tavily.com/search
+      max_results: 6
+      timeout_seconds: 8
+
 insight:
   # Weekly only in V0 (§5.1). See contracts.enums.InsightScope.
   enabled_scopes: [weekly]
